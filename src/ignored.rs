@@ -1,97 +1,83 @@
-//! The ignored list: doc blocks that don't come from the repo, by exact
-//! content, grouped by reason.
+//! The ignore directory (`.asadoc-ignore/` by default): doc blocks that don't
+//! come from the repo. One file per ignored block content, verbatim, in a
+//! subdirectory named after the reason:
+//!
+//! ```text
+//! .asadoc-ignore/
+//!   example-output/nw-dpf-worker-machineconfig--terminal-005.txt
+//!   manual-command/nw-dpf-management-cluster-setup--terminal-002.txt
+//!   no-repo-source/…
+//! ```
+//!
+//! File names are only names (taken from a block that had the content); a doc
+//! block is ignored when its content is exactly a file's content.
 
 use anyhow::{Context, Result};
-use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 pub const REASONS: &[&str] = &["example-output", "manual-command", "no-repo-source"];
 
-const HEADER: &str = "# Doc code blocks that don't come from this repo, by exact content, so no repo
-# code needs to match them. Managed by asadoc (asadoc serve); see its README.
-#   example-output   sample output shown to the reader
-#   manual-command   a command too simple or doc-specific to track
-#   no-repo-source   content with no counterpart in this repo
-";
+#[derive(Clone)]
+pub struct Entry {
+    pub reason: String,
+    pub path: PathBuf,
+    pub content: String,
+}
 
-/// reason → contents, in the order they were added
-#[derive(Default, Clone)]
-pub struct Ignored(pub BTreeMap<String, Vec<String>>);
+pub struct Ignored {
+    dir: PathBuf,
+    pub entries: Vec<Entry>,
+}
 
 impl Ignored {
-    pub fn load(path: &Path) -> Result<Ignored> {
-        if !path.exists() {
-            return Ok(Ignored::default());
-        }
-        let text = std::fs::read_to_string(path)?;
-        let raw: Option<BTreeMap<String, Vec<String>>> =
-            serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        Ok(Ignored(raw.unwrap_or_default()))
-    }
-
-    pub fn save(&self, path: &Path) -> Result<()> {
-        let mut out = format!("{HEADER}\n");
+    pub fn load(dir: &Path) -> Result<Ignored> {
+        let mut entries = Vec::new();
         for reason in REASONS {
-            let Some(contents) = self.0.get(*reason).filter(|c| !c.is_empty()) else { continue };
-            out.push_str(&format!("{reason}:\n"));
-            for c in contents {
-                out.push_str(&literal_item(c));
+            let sub = dir.join(reason);
+            let Ok(read) = std::fs::read_dir(&sub) else { continue };
+            let mut paths: Vec<PathBuf> = read.filter_map(|e| e.ok().map(|e| e.path())).filter(|p| p.is_file()).collect();
+            paths.sort();
+            for path in paths {
+                let content = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+                entries.push(Entry { reason: reason.to_string(), path, content });
             }
         }
-        // Write a new file and move it into place, so a failure never leaves it truncated
-        let tmp = path.with_extension("yaml.tmp");
-        std::fs::write(&tmp, out)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        Ok(Ignored { dir: dir.to_path_buf(), entries })
     }
 
     pub fn reason_of(&self, content: &str) -> Option<&str> {
-        REASONS.iter().copied().find(|r| self.0.get(*r).is_some_and(|c| c.iter().any(|x| x == content)))
+        self.entries.iter().find(|e| e.content == content).map(|e| e.reason.as_str())
     }
 
-    /// Ignores `content` for `reason`, replacing it (and `replacing`, if given) anywhere else
-    pub fn ignore(&mut self, content: &str, reason: &str, replacing: Option<&str>) {
-        self.remove(content);
+    /// Ignores `content` for `reason`, in a file named after `block_ref`,
+    /// replacing it (and `replacing`, if given) wherever else it's ignored
+    pub fn ignore(&mut self, content: &str, reason: &str, block_ref: &str, replacing: Option<&str>) -> Result<()> {
+        self.remove(content)?;
         if let Some(r) = replacing {
-            self.remove(r);
+            self.remove(r)?;
         }
-        self.0.entry(reason.to_string()).or_default().push(content.to_string());
+        let sub = self.dir.join(reason);
+        std::fs::create_dir_all(&sub)?;
+        let base = block_ref.replace('/', "--");
+        let mut path = sub.join(format!("{base}.txt"));
+        let mut n = 2;
+        while path.exists() {
+            path = sub.join(format!("{base}-{n}.txt"));
+            n += 1;
+        }
+        std::fs::write(&path, content)?;
+        self.entries.push(Entry { reason: reason.to_string(), path, content: content.to_string() });
+        Ok(())
     }
 
-    pub fn remove(&mut self, content: &str) {
-        for list in self.0.values_mut() {
-            list.retain(|c| c != content);
+    /// Stops ignoring `content`: removes every file holding it
+    pub fn remove(&mut self, content: &str) -> Result<()> {
+        for e in self.entries.iter().filter(|e| e.content == content) {
+            std::fs::remove_file(&e.path).with_context(|| format!("removing {}", e.path.display()))?;
         }
+        self.entries.retain(|e| e.content != content);
+        Ok(())
     }
-
-    pub fn entries(&self) -> impl Iterator<Item = (&str, &str)> {
-        REASONS.iter().flat_map(|r| self.0.get(*r).into_iter().flatten().map(move |c| (*r, c.as_str())))
-    }
-}
-
-/// A YAML sequence item holding `content` as a literal block scalar
-fn literal_item(content: &str) -> String {
-    let body = content.strip_suffix('\n').unwrap_or(content);
-    let trailing = content.len() - content.trim_end_matches('\n').len();
-    let chomp = match trailing {
-        0 => "-",
-        1 => "",
-        _ => "+",
-    };
-    // An explicit indentation indicator when the first line starts with a space
-    let indicator = if body.starts_with(' ') { "2" } else { "" };
-    let mut out = format!("  - |{indicator}{chomp}\n");
-    for line in body.trim_end_matches('\n').split('\n') {
-        out.push_str(if line.is_empty() { "\n" } else { "    " });
-        if !line.is_empty() {
-            out.push_str(line);
-            out.push('\n');
-        }
-    }
-    for _ in 1..trailing.max(1) {
-        out.push('\n');
-    }
-    out
 }
 
 #[cfg(test)]
@@ -99,18 +85,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn round_trips_awkward_content() {
-        let dir = std::env::temp_dir().join(format!("asadoc-test-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("ignored.yaml");
-        let mut ig = Ignored::default();
-        for c in ["$ oc get nodes\n", "  indented\nnext\n", "no newline", "blank\n\ninside\n", "trailing\n\n", "quote: \"x\" # y\n"] {
-            ig.ignore(c, "manual-command", None);
-        }
-        ig.save(&path).unwrap();
-        let back = Ignored::load(&path).unwrap();
-        assert_eq!(back.0["manual-command"], ig.0["manual-command"]);
+    fn ignores_and_unignores_by_content() {
+        let dir = std::env::temp_dir().join(format!("asadoc-ignore-test-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let mut ig = Ignored::load(&dir).unwrap();
+        ig.ignore("$ oc get nodes\n", "manual-command", "mod/terminal-001", None).unwrap();
+        ig.ignore("  indented\n\nno trailing", "example-output", "mod/terminal-002", None).unwrap();
+        // Same content again moves it; a name taken by other content gets a suffix
+        ig.ignore("$ oc get nodes\n", "example-output", "mod/terminal-002", None).unwrap();
+        let back = Ignored::load(&dir).unwrap();
+        assert_eq!(back.reason_of("$ oc get nodes\n"), Some("example-output"));
+        assert_eq!(back.reason_of("  indented\n\nno trailing"), Some("example-output"));
+        assert!(dir.join("example-output/mod--terminal-002-2.txt").exists());
+        let mut back = back;
+        back.remove("$ oc get nodes\n").unwrap();
+        assert_eq!(Ignored::load(&dir).unwrap().entries.len(), 1);
         std::fs::remove_dir_all(dir).ok();
     }
 }
-

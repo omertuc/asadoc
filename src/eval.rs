@@ -1,8 +1,8 @@
-//! Evaluation: every doc block against all marked code and the ignored list.
+//! Evaluation: every doc block against all marked code and the ignore directory.
 //!
 //! A block is resolved when some marked code (its options applied, its doc
 //! options applied to the block, its placeholders free) matches it; ignored
-//! when its content is in the ignored list; and otherwise still to resolve,
+//! when its content is in the ignore directory; and otherwise still to resolve,
 //! with the repo code most like it as candidates.
 
 use crate::config::Config;
@@ -158,7 +158,7 @@ fn doc_side(block: &Block, doc_options: &[MarkerOption]) -> Option<String> {
 
 pub fn evaluate(config: &Config, with_candidates: bool) -> anyhow::Result<Evaluation> {
     let scan = repo::scan(config);
-    let ignored = Ignored::load(&config.ignored_file)?;
+    let ignored = Ignored::load(&config.ignore_dir)?;
     let mut matched = vec![false; scan.marked.len()];
     let mut used_ignored: std::collections::HashSet<String> = Default::default();
 
@@ -190,9 +190,10 @@ pub fn evaluate(config: &Config, with_candidates: bool) -> anyhow::Result<Evalua
     }
 
     let stale_ignored: Vec<(String, String)> = ignored
-        .entries()
-        .filter(|(_, c)| !used_ignored.contains(*c))
-        .map(|(r, c)| (r.to_string(), c.to_string()))
+        .entries
+        .iter()
+        .filter(|e| !used_ignored.contains(&e.content))
+        .map(|e| (e.reason.clone(), e.content.clone()))
         .collect();
     let unused = (0..scan.marked.len()).filter(|i| !matched[*i]).collect();
 

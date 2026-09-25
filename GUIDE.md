@@ -77,18 +77,30 @@ read, or an option that doesn't fit the code, is reported as a marker problem.
 
 ## Ignored blocks
 
-The ignored file (`ignored` in `asadoc.yaml`) lists, by exact content, doc
-blocks that don't come from the repo:
+Doc blocks that don't come from the repo are ignored by putting their exact
+content in a file under `.asadoc-ignore/` (next to `asadoc.yaml`; `ignore_dir`
+changes it), in a subdirectory for the reason:
 
-- `example-output`: sample output shown to the reader
-- `manual-command`: a command too simple or doc-specific to track
-- `no-repo-source`: content with no counterpart in the repo
+- `example-output/`: sample output shown to the reader
+- `manual-command/`: a command too simple or doc-specific to track
+- `no-repo-source/`: content with no counterpart in the repo
+
+```text
+.asadoc-ignore/
+  example-output/nw-dpf-worker-machineconfig--terminal-005.txt
+  manual-command/nw-dpf-management-cluster-setup--terminal-002.txt
+```
+
+Each file holds the block's content verbatim. File names are only names:
+`asadoc serve` names them after a block that had the content, and one file
+covers every block with the same content.
 
 ## Resolved, ignored, to resolve
 
 A doc block is **resolved** when some marked code, with its options applied, is
 byte-for-byte the block (with the marker's `doc` options applied) apart from its
-placeholders. A block whose content is in the ignored file is **ignored**.
+placeholders. A block whose content is in a file under `.asadoc-ignore/` is
+**ignored**.
 Every other block is still **to resolve**.
 
 Nothing else links the two sides: there's no mapping to keep up to date, and a

@@ -574,7 +574,7 @@ function renderIgnored(b, guide) {
   const sec = el('section', 'resolved');
   const head = el('div', 'resolved-head', `<span class="st">Ignored</span> as <b>${esc(reasonLabel(b.ignoredAs))}</b>`);
   const btn = el('button', 'secondary danger', 'Stop ignoring');
-  btn.title = 'Remove its content from ignored.yaml and send it back to the queue';
+  btn.title = 'Delete its file from .asadoc-ignore/ and send it back to the queue';
   btn.addEventListener('click', () => act('/api/unignore', { asm: b.asm, ref: b.ref }, btn));
   head.appendChild(btn);
   sec.appendChild(head);

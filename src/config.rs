@@ -1,5 +1,5 @@
 //! `asadoc.yaml`: where the docs are, which of them to check, and where the
-//! list of ignored doc blocks lives. Paths are relative to the config file.
+//! directory of ignored doc blocks is. Paths are relative to the config file.
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -16,9 +16,9 @@ struct RawConfig {
     /// AsciiDoc assemblies (relative to the docs checkout) whose code blocks
     /// must come from this repo
     assemblies: Vec<String>,
-    /// Doc blocks that don't come from this repo
-    #[serde(default = "default_ignored")]
-    ignored: PathBuf,
+    /// Directory of doc blocks that don't come from this repo
+    #[serde(default = "default_ignore_dir")]
+    ignore_dir: PathBuf,
     /// Repo paths (prefixes) never scanned for markers
     #[serde(default)]
     exclude: Vec<String>,
@@ -27,8 +27,8 @@ struct RawConfig {
     links: Links,
 }
 
-fn default_ignored() -> PathBuf {
-    PathBuf::from("asadoc-ignored.yaml")
+fn default_ignore_dir() -> PathBuf {
+    PathBuf::from(".asadoc-ignore")
 }
 
 #[derive(Deserialize, Default, Clone, serde::Serialize)]
@@ -45,7 +45,7 @@ pub struct Config {
     pub repo_root: PathBuf,
     pub docs_root: PathBuf,
     pub assemblies: Vec<String>,
-    pub ignored_file: PathBuf,
+    pub ignore_dir: PathBuf,
     pub exclude: Vec<String>,
     pub links: Links,
 }
@@ -67,12 +67,19 @@ impl Config {
         if !docs_root.is_dir() {
             bail!("docs checkout not found at {} (set `docs` in {} or pass --docs)", docs_root.display(), path.display());
         }
+        let repo_root = git_root(&dir)?;
+        let ignore_dir = dir.join(raw.ignore_dir);
+        // The ignore directory holds doc content, not code to match
+        let mut exclude = raw.exclude;
+        if let Ok(rel) = ignore_dir.strip_prefix(&repo_root) {
+            exclude.push(format!("{}/", rel.display()));
+        }
         Ok(Config {
-            repo_root: git_root(&dir)?,
+            repo_root,
             docs_root: docs_root.canonicalize()?,
             assemblies: raw.assemblies,
-            ignored_file: dir.join(raw.ignored),
-            exclude: raw.exclude,
+            ignore_dir,
+            exclude,
             links: raw.links,
         })
     }

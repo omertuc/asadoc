@@ -376,10 +376,9 @@ async fn fix(State(state): State<Shared>, Json(a): Json<BlockAction>) -> Respons
     r.map_or_else(|e| e, IntoResponse::into_response)
 }
 
-fn update_ignored(config: &Config, f: impl FnOnce(&mut Ignored)) -> Result<(), Response> {
-    let mut ig = Ignored::load(&config.ignored_file).map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
-    f(&mut ig);
-    ig.save(&config.ignored_file).map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))
+fn update_ignored(config: &Config, f: impl FnOnce(&mut Ignored) -> Result<()>) -> Result<(), Response> {
+    let mut ig = Ignored::load(&config.ignore_dir).map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))?;
+    f(&mut ig).map_err(|e| error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e:#}")))
 }
 
 async fn ignore(State(state): State<Shared>, Json(a): Json<BlockAction>) -> Response {
@@ -389,7 +388,7 @@ async fn ignore(State(state): State<Shared>, Json(a): Json<BlockAction>) -> Resp
             return Err(error(StatusCode::BAD_REQUEST, "invalid reason"));
         }
         let block = ev.find(&a.asm, &a.reference).ok_or_else(|| error(StatusCode::NOT_FOUND, format!("doc block {} not found", a.reference)))?;
-        update_ignored(config, |ig| ig.ignore(&block.block.content, &reason, a.replacing.as_deref()))?;
+        update_ignored(config, |ig| ig.ignore(&block.block.content, &reason, &block.block.reference, a.replacing.as_deref()))?;
         println!("Ignored {} as {reason}", a.reference);
         done()
     })
