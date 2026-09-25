@@ -8,6 +8,7 @@ mod markers;
 mod matching;
 mod repo;
 mod server;
+mod source;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -21,7 +22,7 @@ struct Cli {
     /// The config file (default: the nearest asadoc.yaml from here up)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
-    /// The docs checkout, instead of the one in the config
+    /// A local docs checkout, instead of the docs in the config
     #[arg(long, global = true)]
     docs: Option<PathBuf>,
     #[command(subcommand)]

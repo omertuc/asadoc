@@ -391,7 +391,7 @@ function select(key) {
 function aiPrompt(b) {
   return `In this repo, make marked code match this docs code block. Run \`asadoc guide\` first to learn how markers work.
 
-  ${data.docsRepo}/modules/${b.module}.adoc, line ${b.line} (${b.ref})
+  ${b.ref}: modules/${b.module}.adoc, line ${b.line}, in the docs at ${data.docsLocation}
 
 Don't edit the docs.
 Check with \`asadoc check ${b.ref}\`: it says why the block isn't resolved, with a diff. You're done when it reports ✓ resolved; show that output.

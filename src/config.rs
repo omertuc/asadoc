@@ -1,6 +1,16 @@
 //! `asadoc.yaml`: where the docs are, which of them to check, and where the
 //! directory of ignored doc blocks is. Paths are relative to the config file.
+//!
+//! ```yaml
+//! docs:
+//!   asciidoc:                  # the docs' format (the only one, for now)
+//!     git: https://github.com/openshift/openshift-docs
+//!     ref: main                # branch, tag or commit
+//!     # or, instead of git and ref, a local checkout: path: ../openshift-docs
+//!     assemblies: [...]
+//! ```
 
+use crate::source::{Docs, GitDocs};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 use std::path::{Path, PathBuf};
@@ -11,11 +21,7 @@ pub const CONFIG_FILE: &str = "asadoc.yaml";
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawConfig {
-    /// The docs checkout
-    docs: PathBuf,
-    /// AsciiDoc assemblies (relative to the docs checkout) whose code blocks
-    /// must come from this repo
-    assemblies: Vec<String>,
+    docs: RawDocs,
     /// Directory of doc blocks that don't come from this repo
     #[serde(default = "default_ignore_dir")]
     ignore_dir: PathBuf,
@@ -27,6 +33,27 @@ struct RawConfig {
     links: Links,
 }
 
+/// The docs, keyed by format
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawDocs {
+    asciidoc: RawAsciidoc,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawAsciidoc {
+    /// A local docs checkout
+    path: Option<PathBuf>,
+    /// A docs git repository (URL, or local path), read at `ref`
+    git: Option<String>,
+    #[serde(rename = "ref")]
+    reference: Option<String>,
+    /// Assemblies (relative to the docs root) whose code blocks must come
+    /// from this repo
+    assemblies: Vec<String>,
+}
+
 fn default_ignore_dir() -> PathBuf {
     PathBuf::from(".asadoc-ignore")
 }
@@ -36,14 +63,15 @@ fn default_ignore_dir() -> PathBuf {
 pub struct Links {
     /// e.g. https://github.com/org/repo/blob/main/
     pub repo: Option<String>,
-    /// e.g. https://github.com/org/docs/blob/main/
+    /// e.g. https://github.com/org/docs/blob/main/ (default for GitHub docs
+    /// repos: the fetched commit)
     pub docs: Option<String>,
 }
 
 pub struct Config {
     /// The git checkout the config file is in: where marked code is looked for
     pub repo_root: PathBuf,
-    pub docs_root: PathBuf,
+    pub docs: Docs,
     pub assemblies: Vec<String>,
     pub ignore_dir: PathBuf,
     pub exclude: Vec<String>,
@@ -59,13 +87,28 @@ impl Config {
         };
         let text = std::fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
         let raw: RawConfig = serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        let dir = path.parent().unwrap_or(Path::new(".")).canonicalize()?;
-        let docs_root = match docs_override {
-            Some(d) => d.to_path_buf(),
-            None => dir.join(&raw.docs),
+        let dir = path.canonicalize()?.parent().unwrap_or(Path::new("/")).to_path_buf();
+        let asciidoc = raw.docs.asciidoc;
+        let local = |root: PathBuf| -> Result<Docs> {
+            if !root.is_dir() {
+                bail!("docs checkout not found at {}", root.display());
+            }
+            Ok(Docs::Local(root.canonicalize()?))
         };
-        if !docs_root.is_dir() {
-            bail!("docs checkout not found at {} (set `docs` in {} or pass --docs)", docs_root.display(), path.display());
+        let docs = match (docs_override, asciidoc.path, asciidoc.git, asciidoc.reference) {
+            (Some(d), ..) => local(d.to_path_buf())?,
+            (None, Some(p), None, None) => local(dir.join(p))?,
+            (None, None, Some(git), Some(reference)) => {
+                // A local repository, relative to the config file like other paths
+                let url = if dir.join(&git).is_dir() { dir.join(&git).canonicalize()?.display().to_string() } else { git };
+                Docs::Git(GitDocs::open(&url, &reference)?)
+            }
+            (None, None, Some(_), None) => bail!("{}: `docs.asciidoc.git` needs a `ref` (branch, tag or commit)", path.display()),
+            _ => bail!("{}: `docs.asciidoc` needs either `path`, or `git` and `ref`", path.display()),
+        };
+        let mut links = raw.links;
+        if links.docs.is_none() {
+            links.docs = docs.default_link_base();
         }
         let repo_root = git_root(&dir)?;
         let ignore_dir = dir.join(raw.ignore_dir);
@@ -76,11 +119,11 @@ impl Config {
         }
         Ok(Config {
             repo_root,
-            docs_root: docs_root.canonicalize()?,
-            assemblies: raw.assemblies,
+            docs,
+            assemblies: asciidoc.assemblies,
             ignore_dir,
             exclude,
-            links: raw.links,
+            links,
         })
     }
 }

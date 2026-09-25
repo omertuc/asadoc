@@ -124,6 +124,26 @@ each placeholder took), or a diff of the block against the most similar repo
 code with marker options applied. It exits 0 only when every given block is
 resolved or ignored.
 
+## asadoc.yaml
+
+```yaml
+docs:
+  asciidoc:                # the docs' format (only AsciiDoc, for now)
+    git: https://github.com/openshift/openshift-docs
+    ref: main              # branch, tag or commit; a commit pins the check
+    assemblies:            # whose modules' code blocks must come from this repo
+      - networking/dpf/dpf-operator-installation.adoc
+links:
+  repo: https://github.com/org/repo/blob/main/   # for "source" links in the UI
+```
+
+asadoc fetches just `ref` of the docs repo, and only the files it reads, into
+`~/.cache/asadoc/`. Instead of `git` and `ref`, `path: ../openshift-docs` reads
+a local checkout as it is on disk (and `asadoc serve` then follows its changes);
+`--docs <dir>` does the same for one run, e.g. to try unmerged docs changes.
+Links to the docs default to the fetched commit on GitHub (`links.docs`
+overrides them).
+
 ## Commands
 
 ```bash

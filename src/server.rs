@@ -79,7 +79,10 @@ fn watch(state: Shared) -> Result<notify::RecommendedWatcher> {
         }
     })?;
     watcher.watch(&state.config.repo_root, RecursiveMode::Recursive)?;
-    watcher.watch(&state.config.docs_root.join("modules"), RecursiveMode::NonRecursive)?;
+    // Docs from git are fixed at the fetched commit
+    if let Some(modules) = state.config.docs.local_modules_dir() {
+        watcher.watch(&modules, RecursiveMode::NonRecursive)?;
+    }
     // Debounce: one notification once changes settle
     tokio::spawn(async move {
         while rx.recv().await.is_some() {
@@ -192,7 +195,8 @@ struct Data {
     stale_ignored: Vec<Stale>,
     code: Vec<CodeData>,
     problems: Vec<Problem>,
-    docs_repo: String,
+    /// Where the docs are, for people
+    docs_location: String,
     links: crate::config::Links,
 }
 
@@ -271,7 +275,7 @@ fn report(config: &Config, ev: &Evaluation) -> Data {
         stale_ignored: ev.stale_ignored.iter().map(|(r, c)| Stale { reason: r.clone(), content: c.clone() }).collect(),
         code,
         problems: ev.scan.problems.clone(),
-        docs_repo: config.docs_root.display().to_string(),
+        docs_location: config.docs.describe(),
         links: config.links.clone(),
     }
 }
@@ -309,16 +313,16 @@ struct ModuleQuery {
 /// A module's text and the attributes it needs, for rendering in the browser
 async fn module(State(state): State<Shared>, Query(q): Query<ModuleQuery>) -> Response {
     let config = &state.config;
-    let Some(assembly) = config.assemblies.iter().find(|a| docs::read_assembly(&config.docs_root, a).id == q.asm) else {
+    let Some(assembly) = config.assemblies.iter().find(|a| docs::read_assembly(&config.docs, a).id == q.asm) else {
         return error(StatusCode::NOT_FOUND, "no such assembly");
     };
     if !q.module.chars().all(|c| c.is_ascii_alphanumeric() || "_.-".contains(c)) {
         return error(StatusCode::BAD_REQUEST, "bad module name");
     }
-    match docs::module_for_rendering(&config.docs_root, &q.module) {
+    match docs::module_for_rendering(&config.docs, &q.module) {
         Some(text) => Json(serde_json::json!({
             "text": text,
-            "attributes": docs::assembly_attributes(&config.docs_root, assembly),
+            "attributes": docs::assembly_attributes(&config.docs, assembly),
         }))
         .into_response(),
         None => error(StatusCode::NOT_FOUND, "no such module"),

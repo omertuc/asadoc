@@ -162,12 +162,16 @@ pub fn evaluate(config: &Config, with_candidates: bool) -> anyhow::Result<Evalua
     let mut matched = vec![false; scan.marked.len()];
     let mut used_ignored: std::collections::HashSet<String> = Default::default();
 
+    // Every file this reads, in two fetches when the docs come from git
+    config.docs.prefetch(&config.assemblies);
+    let read: Vec<_> = config.assemblies.iter().map(|path| docs::read_assembly(&config.docs, path)).collect();
+    config.docs.prefetch(&read.iter().flat_map(|a| a.modules.iter().map(|m| docs::module_path(m))).collect::<Vec<_>>());
+
     let mut assemblies = Vec::new();
-    for path in &config.assemblies {
-        let assembly = docs::read_assembly(&config.docs_root, path);
+    for assembly in read {
         let mut blocks = Vec::new();
         for module in &assembly.modules {
-            for block in docs::extract_blocks(&config.docs_root, module) {
+            for block in docs::extract_blocks(&config.docs, module) {
                 // The block as each set of doc options makes it
                 let mut sides: BTreeMap<String, Option<String>> = BTreeMap::new();
                 let mut matches = Vec::new();

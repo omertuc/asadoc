@@ -2,6 +2,7 @@
 
 use regex::Regex;
 use std::collections::BTreeMap;
+use crate::source::Docs;
 use std::path::Path;
 use std::sync::LazyLock;
 
@@ -43,8 +44,8 @@ pub fn format_ref(module: &str, lang: &str, seq: usize) -> String {
     format!("{module}/{lang}-{seq:03}")
 }
 
-pub fn read_assembly(docs_root: &Path, path: &str) -> Assembly {
-    let text = std::fs::read_to_string(docs_root.join(path)).unwrap_or_default();
+pub fn read_assembly(docs: &Docs, path: &str) -> Assembly {
+    let text = docs.read(path).unwrap_or_default();
     let mut modules: Vec<String> = Vec::new();
     for c in INCLUDE_MODULE.captures_iter(&text) {
         if !modules.iter().any(|m| m == &c[1]) {
@@ -59,8 +60,8 @@ pub fn read_assembly(docs_root: &Path, path: &str) -> Assembly {
     }
 }
 
-pub fn module_path(docs_root: &Path, module: &str) -> std::path::PathBuf {
-    docs_root.join("modules").join(format!("{module}.adoc"))
+pub fn module_path(module: &str) -> String {
+    format!("modules/{module}.adoc")
 }
 
 fn lead_for(lines: &[&str], source_line: usize) -> Option<String> {
@@ -80,8 +81,8 @@ fn lead_for(lines: &[&str], source_line: usize) -> Option<String> {
     None
 }
 
-pub fn extract_blocks(docs_root: &Path, module: &str) -> Vec<Block> {
-    let Ok(text) = std::fs::read_to_string(module_path(docs_root, module)) else { return vec![] };
+pub fn extract_blocks(docs: &Docs, module: &str) -> Vec<Block> {
+    let Some(text) = docs.read(&module_path(module)) else { return vec![] };
     let lines: Vec<&str> = text.split('\n').collect();
     let mut blocks = Vec::new();
     let mut seq_by_lang: BTreeMap<String, usize> = BTreeMap::new();
@@ -142,10 +143,11 @@ const PRESENTATION: &[&str] = &["data-uri", "icons", "imagesdir", "toc", "toc-ti
 /// Attributes for rendering a module of `assembly` standalone: product title and
 /// version (from `_distro_map.yml`, like AsciiBinder), the attribute files the
 /// assembly includes, and the assembly's own header entries.
-pub fn assembly_attributes(docs_root: &Path, assembly: &str) -> BTreeMap<String, String> {
+pub fn assembly_attributes(docs: &Docs, assembly: &str) -> BTreeMap<String, String> {
     let mut attrs = BTreeMap::new();
-    if let Some(distro) = std::fs::read_to_string(docs_root.join("_distro_map.yml"))
-        .ok()
+    docs.prefetch(&["_distro_map.yml".to_string(), "_attributes".to_string(), assembly.to_string()]);
+    if let Some(distro) = docs
+        .read("_distro_map.yml")
         .and_then(|t| serde_yaml::from_str::<serde_yaml::Value>(&t).ok())
     {
         let enterprise = &distro["openshift-enterprise"];
@@ -163,7 +165,7 @@ pub fn assembly_attributes(docs_root: &Path, assembly: &str) -> BTreeMap<String,
             }
         }
     }
-    let text = std::fs::read_to_string(docs_root.join(assembly)).unwrap_or_default();
+    let text = docs.read(assembly).unwrap_or_default();
     // Attribute entries, honoring ifdef/ifndef blocks the way a docs build for
     // the distro (openshift-enterprise) would
     attrs.insert("openshift-enterprise".to_string(), String::new());
@@ -195,7 +197,7 @@ pub fn assembly_attributes(docs_root: &Path, assembly: &str) -> BTreeMap<String,
         }
         if let Some(rest) = line.strip_prefix("include::") {
             if let Some(file) = rest.split('[').next().filter(|f| f.starts_with("_attributes/")) {
-                add_from(&std::fs::read_to_string(docs_root.join(file)).unwrap_or_default(), &mut attrs);
+                add_from(&docs.read(file).unwrap_or_default(), &mut attrs);
             }
         } else if ATTRIBUTE.is_match(line) {
             add_from(line, &mut attrs);
@@ -221,7 +223,7 @@ pub fn assembly_attributes(docs_root: &Path, assembly: &str) -> BTreeMap<String,
 }
 
 /// A module's text for rendering: its `//` comment lines removed
-pub fn module_for_rendering(docs_root: &Path, module: &str) -> Option<String> {
-    let text = std::fs::read_to_string(module_path(docs_root, module)).ok()?;
+pub fn module_for_rendering(docs: &Docs, module: &str) -> Option<String> {
+    let text = docs.read(&module_path(module))?;
     Some(text.split_inclusive('\n').filter(|l| !l.starts_with("//")).collect())
 }
