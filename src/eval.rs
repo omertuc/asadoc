@@ -97,19 +97,19 @@ impl Evaluation {
                 .map(move |block_eval| (assembly_eval, block_eval))
         })
     }
-    pub(crate) fn find(&self, assembly: &str, reference: &str) -> Option<&BlockEval> {
+    pub(crate) fn find(&self, assembly_id: &str, reference: &str) -> Option<&BlockEval> {
         self.blocks()
             .find(|(assembly_eval, block_eval)| {
-                assembly_eval.assembly.id == assembly && block_eval.block.reference == reference
+                assembly_eval.assembly.id == assembly_id && block_eval.block.reference == reference
             })
             .map(|(_, block_eval)| block_eval)
     }
     /// Marked code, by its index in `scan.marked`
-    pub(crate) fn marked(&self, code: usize) -> Result<&MarkedCode> {
+    pub(crate) fn marked(&self, marked_index: usize) -> Result<&MarkedCode> {
         self.scan
             .marked
-            .get(code)
-            .with_context(|| format!("no marked code at index {code}"))
+            .get(marked_index)
+            .with_context(|| format!("no marked code at index {marked_index}"))
     }
 }
 
@@ -143,16 +143,22 @@ fn take_token(remaining: &mut HashMap<&str, usize>, token: &str) -> bool {
     }
 }
 
-fn dice(first: &[String], second: &[String]) -> f64 {
-    if first.is_empty() || second.is_empty() {
+fn dice(first_tokens: &[String], second_tokens: &[String]) -> f64 {
+    if first_tokens.is_empty() || second_tokens.is_empty() {
         return 0.0;
     }
-    let mut remaining = first.iter().fold(HashMap::<&str, usize>::new(), |mut counts, token| {
-        *counts.entry(token).or_default() += 1;
-        counts
-    });
-    let common = second.iter().filter(|token| take_token(&mut remaining, token)).count();
-    2.0 * count_to_f64(common) / count_to_f64(first.len() + second.len())
+    let mut remaining_first_tokens =
+        first_tokens
+            .iter()
+            .fold(HashMap::<&str, usize>::new(), |mut token_counts, token| {
+                *token_counts.entry(token).or_default() += 1;
+                token_counts
+            });
+    let common_token_count = second_tokens
+        .iter()
+        .filter(|token| take_token(&mut remaining_first_tokens, token))
+        .count();
+    2.0 * count_to_f64(common_token_count) / count_to_f64(first_tokens.len() + second_tokens.len())
 }
 
 /// The lines of `text`, trimmed, blank ones skipped
@@ -160,52 +166,52 @@ fn significant_lines(text: &str) -> Vec<&str> {
     text.lines().map(str::trim).filter(|line| !line.is_empty()).collect()
 }
 
-/// The next row of the LCS table: `previous[j]` is the LCS of the lines so far
+/// The next row of the LCS table: `previous_row[j]` is the LCS of the lines so far
 /// and the first j of `other_lines`, and the result is the same with `line` added
-fn next_lcs_row(previous: &[usize], line: &str, other_lines: &[&str]) -> Vec<usize> {
+fn next_lcs_row(previous_row: &[usize], line: &str, other_lines: &[&str]) -> Vec<usize> {
     let cells = other_lines
         .iter()
-        .zip(previous.iter().zip(previous.iter().skip(1)))
-        .scan(0, |left, (other_line, (diagonal, up))| {
-            *left = if line == *other_line {
-                diagonal + 1
+        .zip(previous_row.iter().zip(previous_row.iter().skip(1)))
+        .scan(0, |left_cell, (other_line, (diagonal_cell, up_cell))| {
+            *left_cell = if line == *other_line {
+                diagonal_cell + 1
             } else {
-                (*up).max(*left)
+                (*up_cell).max(*left_cell)
             };
-            Some(*left)
+            Some(*left_cell)
         });
     iter::once(0).chain(cells).collect()
 }
 
 /// Share of lines (trimmed, blank ones skipped) in their longest common subsequence
-fn line_ratio(first: &str, second: &str) -> f64 {
-    let first_lines = significant_lines(first);
-    let second_lines = significant_lines(second);
+fn line_ratio(first_text: &str, second_text: &str) -> f64 {
+    let first_lines = significant_lines(first_text);
+    let second_lines = significant_lines(second_text);
     if first_lines.is_empty() || second_lines.is_empty() {
         return 0.0;
     }
     let last_row = first_lines
         .iter()
-        .fold(vec![0usize; second_lines.len() + 1], |previous, line| {
-            next_lcs_row(&previous, line, &second_lines)
+        .fold(vec![0usize; second_lines.len() + 1], |previous_row, line| {
+            next_lcs_row(&previous_row, line, &second_lines)
         });
-    let common = last_row.last().copied().unwrap_or(0);
-    2.0 * count_to_f64(common) / count_to_f64(first_lines.len() + second_lines.len())
+    let common_line_count = last_row.last().copied().unwrap_or(0);
+    2.0 * count_to_f64(common_line_count) / count_to_f64(first_lines.len() + second_lines.len())
 }
 
 /// How alike two texts are, given their tokens' dice score: that alone when
 /// it's too low, otherwise blended with how their lines line up
-fn blended_similarity(token_score: f64, first: &str, second: &str) -> f64 {
+fn blended_similarity(token_score: f64, first_text: &str, second_text: &str) -> f64 {
     if token_score < MIN_SIMILARITY {
         token_score
     } else {
-        0.5f64.mul_add(line_ratio(first, second), 0.5 * token_score)
+        0.5f64.mul_add(line_ratio(first_text, second_text), 0.5 * token_score)
     }
 }
 
-fn similarity(first: &str, second: &str) -> Result<f64> {
-    let token_score = dice(&tokens(first)?, &tokens(second)?);
-    Ok(blended_similarity(token_score, first, second))
+fn similarity(first_text: &str, second_text: &str) -> Result<f64> {
+    let token_score = dice(&tokens(first_text)?, &tokens(second_text)?);
+    Ok(blended_similarity(token_score, first_text, second_text))
 }
 
 // ---------------------------------------------------------------------------
@@ -216,14 +222,14 @@ fn similarity(first: &str, second: &str) -> Result<f64> {
 /// doc options applied, and the code with its placeholders filled in from it.
 /// None when the doc options don't fit the block.
 pub(crate) fn compare(code: &MarkedCode, block: &Block) -> Result<Option<(String, String)>> {
-    let Some(doc) = doc_side(block, &code.doc_options) else {
+    let Some(block_side) = doc_side(block, &code.doc_options) else {
         return Ok(None);
     };
-    let filled = code
+    let filled_code = code
         .matcher
-        .fill(&doc)
+        .fill(&block_side)
         .with_context(|| format!("filling in the placeholders of {}", code.id))?;
-    Ok(Some((doc, filled)))
+    Ok(Some((block_side, filled_code)))
 }
 
 /// The doc block most like some marked code, with `compare`'s two sides
@@ -231,23 +237,26 @@ pub(crate) fn closest_block<'a>(
     evaluation: &'a Evaluation,
     code: &MarkedCode,
 ) -> Result<Option<(&'a BlockEval, String, String)>> {
-    let best = evaluation.blocks().try_fold(
+    let closest = evaluation.blocks().try_fold(
         None::<(f64, &BlockEval, String, String)>,
-        |best, (_, block_eval)| -> Result<_> {
-            let Some((doc, filled)) = compare(code, &block_eval.block)? else {
-                return Ok(best);
+        |closest_so_far, (_, block_eval)| -> Result<_> {
+            let Some((block_side, filled_code)) = compare(code, &block_eval.block)? else {
+                return Ok(closest_so_far);
             };
-            let score = similarity(&doc, &filled)
+            let score = similarity(&block_side, &filled_code)
                 .with_context(|| format!("comparing {} with {}", code.id, block_eval.block.reference))?;
-            let is_better = score >= MIN_SIMILARITY && best.as_ref().is_none_or(|(best_score, ..)| score > *best_score);
-            Ok(if is_better {
-                Some((score, block_eval, doc, filled))
+            let is_closer = score >= MIN_SIMILARITY
+                && closest_so_far
+                    .as_ref()
+                    .is_none_or(|(closest_score, ..)| score > *closest_score);
+            Ok(if is_closer {
+                Some((score, block_eval, block_side, filled_code))
             } else {
-                best
+                closest_so_far
             })
         },
     )?;
-    Ok(best.map(|(_, block_eval, doc, filled)| (block_eval, doc, filled)))
+    Ok(closest.map(|(_, block_eval, block_side, filled_code)| (block_eval, block_side, filled_code)))
 }
 
 /// The block with doc options applied; None when they don't fit it (so no code with them can match)
@@ -262,14 +271,14 @@ pub(crate) fn evaluate(config: &AsadocConfig, with_candidates: bool) -> Result<E
     let mut assemblies = read_assemblies(config)?
         .into_iter()
         .map(|assembly| {
-            let id = assembly.id.clone();
+            let assembly_id = assembly.id.clone();
             evaluate_assembly(config, assembly, &scan, &ignored)
-                .with_context(|| format!("evaluating the assembly {id}"))
+                .with_context(|| format!("evaluating the assembly {assembly_id}"))
         })
         .collect::<Result<Vec<_>>>()?;
 
     let stale_ignored = stale_ignored(&assemblies, &ignored);
-    let unused = unused_code(&assemblies, &scan);
+    let unused_marked = unused_code(&assemblies, &scan);
 
     if with_candidates {
         add_candidates(&mut assemblies, &scan, &stale_ignored).context("finding code like the blocks to resolve")?;
@@ -279,7 +288,7 @@ pub(crate) fn evaluate(config: &AsadocConfig, with_candidates: bool) -> Result<E
         assemblies,
         scan,
         stale_ignored,
-        unused,
+        unused: unused_marked,
     })
 }
 
@@ -293,7 +302,10 @@ fn read_assemblies(config: &AsadocConfig) -> Result<Vec<Assembly>> {
     let assemblies = config
         .assemblies
         .iter()
-        .map(|path| docs::read_assembly(&config.docs, path).with_context(|| format!("reading the assembly {path}")))
+        .map(|assembly_path| {
+            docs::read_assembly(&config.docs, assembly_path)
+                .with_context(|| format!("reading the assembly {assembly_path}"))
+        })
         .collect::<Result<Vec<_>>>()?;
     let module_paths = assemblies
         .iter()
@@ -309,7 +321,7 @@ fn evaluate_assembly(
     scan: &Scan,
     ignored: &Ignored,
 ) -> Result<AssemblyEval> {
-    let blocks = assembly
+    let block_evals = assembly
         .modules
         .iter()
         .map(|module| evaluate_module(config, module, scan, ignored))
@@ -317,7 +329,10 @@ fn evaluate_assembly(
         .into_iter()
         .flatten()
         .collect();
-    Ok(AssemblyEval { assembly, blocks })
+    Ok(AssemblyEval {
+        assembly,
+        blocks: block_evals,
+    })
 }
 
 fn evaluate_module(config: &AsadocConfig, module: &str, scan: &Scan, ignored: &Ignored) -> Result<Vec<BlockEval>> {
@@ -347,27 +362,32 @@ fn evaluate_block(block: Block, scan: &Scan, ignored: &Ignored) -> Result<BlockE
 /// All the marked code that matches the block
 fn match_block(block: &Block, marked: &[MarkedCode]) -> Result<Vec<CodeMatch>> {
     // The block as each set of doc options makes it
-    let mut sides: BTreeMap<String, Option<String>> = BTreeMap::new();
+    let mut block_sides_by_doc_options: BTreeMap<String, Option<String>> = BTreeMap::new();
     marked
         .iter()
         .enumerate()
-        .filter_map(|(index, code)| {
-            let doc = sides
+        .filter_map(|(marked_index, code)| {
+            let block_side = block_sides_by_doc_options
                 .entry(format!("{:?}", code.doc_options))
                 .or_insert_with(|| doc_side(block, &code.doc_options))
                 .as_deref()?;
             code.matcher
-                .matches(doc)
+                .matches(block_side)
                 .with_context(|| format!("matching {} against {}", code.id, block.reference))
                 .transpose()
-                .map(|values| values.map(|values| CodeMatch { code: index, values }))
+                .map(|match_result| {
+                    match_result.map(|values| CodeMatch {
+                        code: marked_index,
+                        values,
+                    })
+                })
         })
         .collect()
 }
 
 /// Ignored entries no doc block has anymore: (reason, content)
 fn stale_ignored(assemblies: &[AssemblyEval], ignored: &Ignored) -> Vec<(String, String)> {
-    let used: HashSet<&str> = assemblies
+    let ignored_contents_in_use: HashSet<&str> = assemblies
         .iter()
         .flat_map(|assembly_eval| &assembly_eval.blocks)
         .filter(|block_eval| block_eval.ignored_as.is_some())
@@ -376,34 +396,34 @@ fn stale_ignored(assemblies: &[AssemblyEval], ignored: &Ignored) -> Vec<(String,
     ignored
         .entries
         .iter()
-        .filter(|entry| !used.contains(entry.content.as_str()))
-        .map(|entry| (entry.reason.clone(), entry.content.clone()))
+        .filter(|ignored_entry| !ignored_contents_in_use.contains(ignored_entry.content.as_str()))
+        .map(|ignored_entry| (ignored_entry.reason.clone(), ignored_entry.content.clone()))
         .collect()
 }
 
 /// Marked code no doc block matches (indexes into `scan.marked`)
 fn unused_code(assemblies: &[AssemblyEval], scan: &Scan) -> Vec<usize> {
-    let matched: HashSet<usize> = assemblies
+    let matched_indexes: HashSet<usize> = assemblies
         .iter()
         .flat_map(|assembly_eval| &assembly_eval.blocks)
         .flat_map(|block_eval| &block_eval.matches)
         .map(|code_match| code_match.code)
         .collect();
     (0..scan.marked.len())
-        .filter(|index| !matched.contains(index))
+        .filter(|marked_index| !matched_indexes.contains(marked_index))
         .collect()
 }
 
 /// For each block still to resolve: the code most like it, and the stale
 /// ignored content it probably used to be
 fn add_candidates(assemblies: &mut [AssemblyEval], scan: &Scan, stale_ignored: &[(String, String)]) -> Result<()> {
-    let pool = candidate_pool(scan).context("tokenizing the repo code")?;
+    let pool_entries = candidate_pool(scan).context("tokenizing the repo code")?;
     assemblies
         .iter_mut()
         .flat_map(|assembly_eval| &mut assembly_eval.blocks)
         .filter(|block_eval| !block_eval.done())
         .try_for_each(|block_eval| {
-            block_eval.candidates = candidates_for(&block_eval.block, &pool)
+            block_eval.candidates = candidates_for(&block_eval.block, &pool_entries)
                 .with_context(|| format!("finding code resembling {}", block_eval.block.reference))?;
             block_eval.formerly = formerly(&block_eval.block, stale_ignored)
                 .with_context(|| format!("comparing {} with ignored content", block_eval.block.reference))?
@@ -418,44 +438,47 @@ fn add_candidates(assemblies: &mut [AssemblyEval], scan: &Scan, stale_ignored: &
 fn formerly(block: &Block, stale_ignored: &[(String, String)]) -> Result<Option<Formerly>> {
     stale_ignored
         .iter()
-        .try_fold(None::<Formerly>, |best, (reason, content)| {
+        .try_fold(None::<Formerly>, |closest_so_far, (reason, content)| {
             let score = similarity(&block.content, content)?;
-            let is_better = score >= 0.5 && best.as_ref().is_none_or(|best| score >= best.similarity);
-            Ok(if is_better {
+            let is_closer = score >= 0.5
+                && closest_so_far
+                    .as_ref()
+                    .is_none_or(|closest| score >= closest.similarity);
+            Ok(if is_closer {
                 Some(Formerly {
                     reason: reason.clone(),
                     content: content.clone(),
                     similarity: score,
                 })
             } else {
-                best
+                closest_so_far
             })
         })
 }
 
-struct PoolEntry<'a> {
+struct CandidatePoolEntry<'a> {
     id: String,
     candidate: Candidate<'a>,
     tokens: Vec<String>,
 }
 
 /// All marked code (in a scanned file), then every unmarked file
-fn candidate_pool(scan: &Scan) -> Result<Vec<PoolEntry<'_>>> {
-    let files: HashMap<&str, &RepoFile> = scan.files.iter().map(|file| (file.file.as_str(), file)).collect();
-    let marked = scan
+fn candidate_pool(scan: &Scan) -> Result<Vec<CandidatePoolEntry<'_>>> {
+    let files_by_path: HashMap<&str, &RepoFile> = scan.files.iter().map(|file| (file.file.as_str(), file)).collect();
+    let marked_entries = scan
         .marked
         .iter()
-        .filter_map(|code| Some(marked_pool_entry(code, files.get(code.file.as_str())?)));
-    let unmarked = scan
+        .filter_map(|code| Some(marked_pool_entry(code, files_by_path.get(code.file.as_str())?)));
+    let unmarked_entries = scan
         .files
         .iter()
         .filter(|file| file.markers.file.is_none())
         .map(unmarked_pool_entry);
-    marked.chain(unmarked).collect()
+    marked_entries.chain(unmarked_entries).collect()
 }
 
-fn marked_pool_entry<'a>(code: &'a MarkedCode, file: &'a RepoFile) -> Result<PoolEntry<'a>> {
-    Ok(PoolEntry {
+fn marked_pool_entry<'a>(code: &'a MarkedCode, file: &'a RepoFile) -> Result<CandidatePoolEntry<'a>> {
+    Ok(CandidatePoolEntry {
         id: code.id.clone(),
         tokens: tokens(&code.content).with_context(|| format!("tokenizing {}", code.id))?,
         candidate: Candidate {
@@ -468,8 +491,8 @@ fn marked_pool_entry<'a>(code: &'a MarkedCode, file: &'a RepoFile) -> Result<Poo
     })
 }
 
-fn unmarked_pool_entry(file: &RepoFile) -> Result<PoolEntry<'_>> {
-    Ok(PoolEntry {
+fn unmarked_pool_entry(file: &RepoFile) -> Result<CandidatePoolEntry<'_>> {
+    Ok(CandidatePoolEntry {
         id: file.file.clone(),
         tokens: tokens(&file.text).with_context(|| format!("tokenizing {}", file.file))?,
         candidate: Candidate {
@@ -482,22 +505,22 @@ fn unmarked_pool_entry(file: &RepoFile) -> Result<PoolEntry<'_>> {
     })
 }
 
-fn candidates_for(block: &Block, pool: &[PoolEntry<'_>]) -> Result<Vec<CandidateInfo>> {
-    let unprompted = unprompted_content(block);
-    let unprompted_tokens = tokens(&unprompted).context("tokenizing the block")?;
-    let mut scored = pool
+fn candidates_for(block: &Block, pool_entries: &[CandidatePoolEntry<'_>]) -> Result<Vec<CandidateInfo>> {
+    let block_without_prompts = unprompted_content(block);
+    let block_tokens = tokens(&block_without_prompts).context("tokenizing the block")?;
+    let mut candidates = pool_entries
         .iter()
-        .filter_map(|entry| score_candidate(block, entry, &unprompted, &unprompted_tokens).transpose())
+        .filter_map(|pool_entry| score_candidate(block, pool_entry, &block_without_prompts, &block_tokens).transpose())
         .collect::<Result<Vec<_>>>()?;
-    scored.sort_by(|first, second| {
+    candidates.sort_by(|first, second| {
         second
             .plan
             .is_some()
             .cmp(&first.plan.is_some())
             .then(second.similarity.total_cmp(&first.similarity))
     });
-    scored.truncate(MAX_CANDIDATES);
-    Ok(scored)
+    candidates.truncate(MAX_CANDIDATES);
+    Ok(candidates)
 }
 
 /// The block's content without its shell prompts, when it has any
@@ -512,33 +535,33 @@ fn unprompted_content(block: &Block) -> String {
 /// A pool entry as a candidate for the block; None when it's too unlike it
 fn score_candidate(
     block: &Block,
-    entry: &PoolEntry<'_>,
-    unprompted: &str,
-    unprompted_tokens: &[String],
+    pool_entry: &CandidatePoolEntry<'_>,
+    block_without_prompts: &str,
+    block_tokens: &[String],
 ) -> Result<Option<CandidateInfo>> {
-    let plan =
-        lightbulb::plan_for(block, &entry.candidate).with_context(|| format!("looking for a fix in {}", entry.id))?;
-    let code = entry.candidate.marked;
+    let plan = lightbulb::plan_for(block, &pool_entry.candidate)
+        .with_context(|| format!("looking for a fix in {}", pool_entry.id))?;
+    let code = pool_entry.candidate.marked;
     let doc_options = candidate_doc_options(code, plan.as_ref());
-    let doc = doc_side(block, &doc_options).unwrap_or_else(|| block.content.clone());
+    let block_side = doc_side(block, &doc_options).unwrap_or_else(|| block.content.clone());
     let section_to_mark = plan.as_ref().and_then(section_to_mark);
-    let content = candidate_content(&entry.candidate, section_to_mark, &doc)?;
+    let content = candidate_content(&pool_entry.candidate, section_to_mark, &block_side)?;
     let similarity = if plan.is_some() {
         1.0
     } else {
-        let score = blended_similarity(dice(unprompted_tokens, &entry.tokens), unprompted, &content);
+        let score = blended_similarity(dice(block_tokens, &pool_entry.tokens), block_without_prompts, &content);
         if score < MIN_SIMILARITY {
             return Ok(None);
         }
         score
     };
     Ok(Some(CandidateInfo {
-        id: entry.id.clone(),
+        id: pool_entry.id.clone(),
         kind: candidate_kind(section_to_mark, code),
-        file: entry.candidate.file.to_owned(),
-        name: entry.candidate.section.map(str::to_owned),
+        file: pool_entry.candidate.file.to_owned(),
+        name: pool_entry.candidate.section.map(str::to_owned),
         lines: section_to_mark
-            .map(|(line, count)| (line, line + count - 1))
+            .map(|(first_line, line_count)| (first_line, first_line + line_count - 1))
             .or_else(|| code.and_then(|code| code.lines)),
         marker_lines: code.map(|code| code.marker_lines.clone()).unwrap_or_default(),
         options: code.map(|code| code.options.clone()).unwrap_or_default(),
@@ -547,8 +570,8 @@ fn score_candidate(
         plan,
         similarity,
         content,
-        doc,
-        file_text: entry.candidate.text.to_owned(),
+        doc: block_side,
+        file_text: pool_entry.candidate.text.to_owned(),
     }))
 }
 
@@ -563,28 +586,36 @@ fn candidate_doc_options(code: Option<&MarkedCode>, plan: Option<&Plan>) -> Vec<
 /// The lines the plan would mark as a section: (first line, count)
 fn section_to_mark(plan: &Plan) -> Option<(usize, usize)> {
     plan.fixes.iter().find_map(|fix| match fix {
-        Fix::MarkSection { line, lines, .. } => Some((*line, *lines)),
+        Fix::MarkSection {
+            line: first_line,
+            lines: line_count,
+            ..
+        } => Some((*first_line, *line_count)),
         _ => None,
     })
 }
 
 /// What the block is compared with: the would-be section, the code with its
 /// placeholders filled in, or the whole unmarked file
-fn candidate_content(candidate: &Candidate<'_>, section_to_mark: Option<(usize, usize)>, doc: &str) -> Result<String> {
+fn candidate_content(
+    candidate: &Candidate<'_>,
+    section_to_mark: Option<(usize, usize)>,
+    block_side: &str,
+) -> Result<String> {
     Ok(match (section_to_mark, candidate.marked) {
-        (Some((line, count)), _) => {
+        (Some((first_line, line_count)), _) => {
             candidate
                 .text
                 .split('\n')
-                .skip(line - 1)
-                .take(count)
+                .skip(first_line - 1)
+                .take(line_count)
                 .collect::<Vec<_>>()
                 .join("\n")
                 + "\n"
         }
         (None, Some(code)) => code
             .matcher
-            .fill(doc)
+            .fill(block_side)
             .with_context(|| format!("filling in the placeholders of {}", code.id))?,
         (None, None) => candidate.text.to_owned(),
     })

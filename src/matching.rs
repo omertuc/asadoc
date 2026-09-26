@@ -11,17 +11,17 @@ use std::fmt::Write;
 /// The value each placeholder took
 pub(crate) type Values = BTreeMap<String, String>;
 
-struct Pattern {
+struct PlaceholderPattern {
     regex: Regex,
     /// (placeholder, capture group)
-    groups: Vec<(String, String)>,
+    placeholder_groups: Vec<(String, String)>,
 }
 
 /// A regex finding any of the placeholders, longest first
 fn placeholder_finder(placeholders: &[&String]) -> Result<Regex> {
-    let mut by_length = placeholders.to_vec();
-    by_length.sort_by_key(|placeholder| Reverse(placeholder.len()));
-    let alternation = by_length
+    let mut longest_first = placeholders.to_vec();
+    longest_first.sort_by_key(|placeholder| Reverse(placeholder.len()));
+    let alternation = longest_first
         .iter()
         .map(|placeholder| fancy_regex::escape(placeholder).into_owned())
         .collect::<Vec<_>>()
@@ -29,36 +29,39 @@ fn placeholder_finder(placeholders: &[&String]) -> Result<Regex> {
     Regex::new(&format!("({alternation})")).context("compiling the placeholder regex")
 }
 
-impl Pattern {
+impl PlaceholderPattern {
     fn new(content: &str, placeholders: &[&String]) -> Result<Self> {
         let finder = placeholder_finder(placeholders)?;
-        let mut groups: Vec<(String, String)> = Vec::new();
-        let mut source = String::from(r"\A");
-        let mut consumed = 0;
-        for found in finder.find_iter(content) {
-            let found = found.context("finding placeholders")?;
-            let between = content
-                .get(consumed..found.start())
+        let mut placeholder_groups: Vec<(String, String)> = Vec::new();
+        let mut regex_source = String::from(r"\A");
+        let mut consumed_until = 0;
+        for placeholder_match in finder.find_iter(content) {
+            let placeholder_match = placeholder_match.context("finding placeholders")?;
+            let text_before_placeholder = content
+                .get(consumed_until..placeholder_match.start())
                 .context("placeholder match isn't on character boundaries")?;
-            source.push_str(&fancy_regex::escape(between));
-            let placeholder = found.as_str();
-            if let Some((_, group)) = groups.iter().find(|(known, _)| known == placeholder) {
-                write!(source, r"\k<{group}>").context("writing a placeholder backreference")?;
+            regex_source.push_str(&fancy_regex::escape(text_before_placeholder));
+            let placeholder = placeholder_match.as_str();
+            if let Some((_, group_name)) = placeholder_groups
+                .iter()
+                .find(|(known_placeholder, _)| known_placeholder == placeholder)
+            {
+                write!(regex_source, r"\k<{group_name}>").context("writing a placeholder backreference")?;
             } else {
-                let group = format!("p{}", groups.len());
-                write!(source, r"(?<{group}>[^\n]*?)").context("writing a placeholder group")?;
-                groups.push((placeholder.to_owned(), group));
+                let group_name = format!("p{}", placeholder_groups.len());
+                write!(regex_source, r"(?<{group_name}>[^\n]*?)").context("writing a placeholder group")?;
+                placeholder_groups.push((placeholder.to_owned(), group_name));
             }
-            consumed = found.end();
+            consumed_until = placeholder_match.end();
         }
-        let tail = content
-            .get(consumed..)
+        let text_after_placeholders = content
+            .get(consumed_until..)
             .context("placeholder match isn't on character boundaries")?;
-        source.push_str(&fancy_regex::escape(tail));
-        source.push_str(r"\z");
+        regex_source.push_str(&fancy_regex::escape(text_after_placeholders));
+        regex_source.push_str(r"\z");
         Ok(Self {
-            regex: Regex::new(&source).context("compiling the pattern for the code")?,
-            groups,
+            regex: Regex::new(&regex_source).context("compiling the pattern for the code")?,
+            placeholder_groups,
         })
     }
 
@@ -67,13 +70,13 @@ impl Pattern {
             return Ok(None);
         };
         Ok(Some(
-            self.groups
+            self.placeholder_groups
                 .iter()
-                .map(|(placeholder, group)| {
+                .map(|(placeholder, group_name)| {
                     (
                         placeholder.clone(),
                         captures
-                            .name(group)
+                            .name(group_name)
                             .map(|capture| capture.as_str().to_owned())
                             .unwrap_or_default(),
                     )
@@ -89,9 +92,9 @@ impl Pattern {
             .iter()
             .enumerate()
             .skip(start)
-            .find_map(|(index, doc_line)| {
+            .find_map(|(doc_line_index, doc_line)| {
                 self.captures(doc_line)
-                    .map(|values| values.map(|values| (index, values)))
+                    .map(|captured| captured.map(|values| (doc_line_index, values)))
                     .transpose()
             })
             .transpose()
@@ -102,30 +105,30 @@ impl Pattern {
 /// against every doc block.
 pub(crate) struct Matcher {
     content: String,
-    whole: Option<Pattern>,
+    whole_pattern: Option<PlaceholderPattern>,
     /// For each line of the content with placeholders: its pattern (for filling
     /// placeholders in for display)
-    lines: Vec<Option<Pattern>>,
+    line_patterns: Vec<Option<PlaceholderPattern>>,
 }
 
 impl Matcher {
     pub(crate) fn new(content: &str, placeholders: &[String]) -> Result<Self> {
-        let used: Vec<&String> = placeholders
+        let used_placeholders: Vec<&String> = placeholders
             .iter()
             .filter(|placeholder| content.contains(placeholder.as_str()))
             .collect();
-        let lines = content
+        let line_patterns = content
             .split('\n')
             .map(|line| {
-                let on_line: Vec<&String> = used
+                let placeholders_on_line: Vec<&String> = used_placeholders
                     .iter()
                     .copied()
                     .filter(|placeholder| line.contains(placeholder.as_str()))
                     .collect();
-                if on_line.is_empty() {
+                if placeholders_on_line.is_empty() {
                     Ok(None)
                 } else {
-                    Pattern::new(line, &on_line)
+                    PlaceholderPattern::new(line, &placeholders_on_line)
                         .map(Some)
                         .with_context(|| format!("building the pattern for line {line:?}"))
                 }
@@ -133,20 +136,23 @@ impl Matcher {
             .collect::<Result<_>>()?;
         Ok(Self {
             content: content.to_owned(),
-            whole: if used.is_empty() {
+            whole_pattern: if used_placeholders.is_empty() {
                 None
             } else {
-                Some(Pattern::new(content, &used).context("building the pattern for the whole code")?)
+                Some(
+                    PlaceholderPattern::new(content, &used_placeholders)
+                        .context("building the pattern for the whole code")?,
+                )
             },
-            lines,
+            line_patterns,
         })
     }
 
     /// Whether the code matches `doc`, and if so the value each placeholder took
     pub(crate) fn matches(&self, doc: &str) -> Result<Option<Values>> {
-        match &self.whole {
+        match &self.whole_pattern {
             None => Ok((self.content == doc).then(Values::new)),
-            Some(pattern) => pattern.captures(doc),
+            Some(whole_pattern) => whole_pattern.captures(doc),
         }
     }
 
@@ -155,21 +161,21 @@ impl Matcher {
     /// takes its values from the next doc line of the same shape, after the
     /// doc lines already matched.
     pub(crate) fn fill(&self, doc: &str) -> Result<String> {
-        if self.whole.is_none() {
+        if self.whole_pattern.is_none() {
             return Ok(self.content.clone());
         }
         let doc_lines: Vec<&str> = doc.split('\n').collect();
-        // The first doc line not matched yet
-        let mut next = 0;
-        let mut filled = Vec::new();
-        for (line, pattern) in self.content.split('\n').zip(&self.lines) {
-            let (filled_line, matched_at) = fill_line(line, pattern.as_ref(), &doc_lines, next)?;
-            if let Some(index) = matched_at {
-                next = index + 1;
+        let mut first_unmatched_doc_line = 0;
+        let mut filled_lines = Vec::new();
+        for (line, line_pattern) in self.content.split('\n').zip(&self.line_patterns) {
+            let (filled_line, matched_at) =
+                fill_line(line, line_pattern.as_ref(), &doc_lines, first_unmatched_doc_line)?;
+            if let Some(matched_doc_line) = matched_at {
+                first_unmatched_doc_line = matched_doc_line + 1;
             }
-            filled.push(filled_line);
+            filled_lines.push(filled_line);
         }
-        Ok(filled.join("\n"))
+        Ok(filled_lines.join("\n"))
     }
 }
 
@@ -177,25 +183,27 @@ impl Matcher {
 /// (from `start` on) it matched, if any
 fn fill_line(
     line: &str,
-    pattern: Option<&Pattern>,
+    line_pattern: Option<&PlaceholderPattern>,
     doc_lines: &[&str],
     start: usize,
 ) -> Result<(String, Option<usize>)> {
-    let Some(pattern) = pattern else {
+    let Some(line_pattern) = line_pattern else {
         let matched_at = doc_lines
             .iter()
             .enumerate()
             .skip(start)
             .find(|(_, doc_line)| **doc_line == line)
-            .map(|(index, _)| index);
+            .map(|(doc_line_index, _)| doc_line_index);
         return Ok((line.to_owned(), matched_at));
     };
-    Ok(match pattern.first_match(doc_lines, start)? {
-        Some((index, values)) => {
-            let filled = values.iter().fold(line.to_owned(), |filled, (placeholder, value)| {
-                filled.replace(placeholder.as_str(), value)
-            });
-            (filled, Some(index))
+    Ok(match line_pattern.first_match(doc_lines, start)? {
+        Some((doc_line_index, values)) => {
+            let filled_line = values
+                .iter()
+                .fold(line.to_owned(), |partly_filled, (placeholder, value)| {
+                    partly_filled.replace(placeholder.as_str(), value)
+                });
+            (filled_line, Some(doc_line_index))
         }
         None => (line.to_owned(), None),
     })
