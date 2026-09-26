@@ -18,11 +18,11 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub(crate) const CONFIG_FILE: &str = "asadoc.yaml";
+pub(crate) const CONFIG_FILE_NAME: &str = "asadoc.yaml";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct RawConfig {
+struct RawAsadocConfig {
     docs: RawDocs,
     /// Directory of doc blocks that don't come from this repo
     #[serde(default = "default_ignore_dir")]
@@ -82,87 +82,89 @@ pub(crate) struct AsadocConfig {
 
 impl AsadocConfig {
     /// Loads `path`, or the nearest `asadoc.yaml` from the working directory up.
-    pub(crate) fn load(path: Option<&Path>, docs_override: Option<&Path>) -> Result<Self> {
-        let path = match path {
-            Some(path) => path.to_path_buf(),
+    pub(crate) fn load(config_path: Option<&Path>, docs_override: Option<&Path>) -> Result<Self> {
+        let config_path = match config_path {
+            Some(given_path) => given_path.to_path_buf(),
             None => find_config().context("looking for the config file")?,
         };
-        let text = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        let raw: RawConfig = serde_yaml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        let dir = path
+        let config_text =
+            fs::read_to_string(&config_path).with_context(|| format!("reading {}", config_path.display()))?;
+        let raw_config: RawAsadocConfig =
+            serde_yaml::from_str(&config_text).with_context(|| format!("parsing {}", config_path.display()))?;
+        let config_dir = config_path
             .canonicalize()
-            .with_context(|| format!("resolving {}", path.display()))?
+            .with_context(|| format!("resolving {}", config_path.display()))?
             .parent()
             .unwrap_or_else(|| Path::new("/"))
             .to_path_buf();
         let docs = match docs_override {
             Some(docs_dir) => local_docs(docs_dir).context("opening the --docs checkout")?,
-            None => configured_docs(&path, &dir, &raw.docs.asciidoc)?,
+            None => configured_docs(&config_path, &config_dir, &raw_config.docs.asciidoc)?,
         };
         let links = Links {
-            docs: raw.links.docs.or_else(|| docs.default_link_base()),
-            ..raw.links
+            docs: raw_config.links.docs.or_else(|| docs.default_link_base()),
+            ..raw_config.links
         };
-        let repo_root = git_root(&dir).context("finding the repo the config file is in")?;
-        let ignore_dir = dir.join(raw.ignore_dir);
+        let repo_root = git_root(&config_dir).context("finding the repo the config file is in")?;
+        let ignore_dir = config_dir.join(raw_config.ignore_dir);
         // The ignore directory holds doc content, not code to match
-        let ignore_exclude = ignore_dir
+        let ignore_dir_exclude = ignore_dir
             .strip_prefix(&repo_root)
             .ok()
-            .map(|relative| format!("{}/", relative.display()));
+            .map(|relative_ignore_dir| format!("{}/", relative_ignore_dir.display()));
         Ok(Self {
             repo_root,
             docs,
-            assemblies: raw.docs.asciidoc.assemblies,
+            assemblies: raw_config.docs.asciidoc.assemblies,
             ignore_dir,
-            exclude: raw.exclude.into_iter().chain(ignore_exclude).collect(),
+            exclude: raw_config.exclude.into_iter().chain(ignore_dir_exclude).collect(),
             links,
         })
     }
 }
 
-/// The docs the config file at `path` (in `dir`) points to
-fn configured_docs(path: &Path, dir: &Path, asciidoc: &RawAsciidoc) -> Result<Docs> {
-    match (&asciidoc.path, &asciidoc.git, &asciidoc.reference) {
+/// The docs the config file at `config_path` (in `config_dir`) points to
+fn configured_docs(config_path: &Path, config_dir: &Path, raw_asciidoc: &RawAsciidoc) -> Result<Docs> {
+    match (&raw_asciidoc.path, &raw_asciidoc.git, &raw_asciidoc.reference) {
         (Some(local_path), None, None) => {
-            local_docs(&dir.join(local_path)).context("opening the configured docs checkout")
+            local_docs(&config_dir.join(local_path)).context("opening the configured docs checkout")
         }
-        (None, Some(git), Some(reference)) => git_docs(dir, git, reference),
+        (None, Some(git_repo), Some(reference)) => git_docs(config_dir, git_repo, reference),
         (None, Some(_), None) => bail!(
             "{}: `docs.asciidoc.git` needs a `ref` (branch, tag or commit)",
-            path.display()
+            config_path.display()
         ),
         _ => bail!(
             "{}: `docs.asciidoc` needs either `path`, or `git` and `ref`",
-            path.display()
+            config_path.display()
         ),
     }
 }
 
-/// A local docs checkout at `root`
-fn local_docs(root: &Path) -> Result<Docs> {
-    if !root.is_dir() {
-        bail!("docs checkout not found at {}", root.display());
+/// A local docs checkout at `docs_root`
+fn local_docs(docs_root: &Path) -> Result<Docs> {
+    if !docs_root.is_dir() {
+        bail!("docs checkout not found at {}", docs_root.display());
     }
-    let root = root
+    let docs_root = docs_root
         .canonicalize()
-        .with_context(|| format!("resolving the docs checkout {}", root.display()))?;
-    Ok(Docs::Local(root))
+        .with_context(|| format!("resolving the docs checkout {}", docs_root.display()))?;
+    Ok(Docs::Local(docs_root))
 }
 
-/// The docs git repository `git` (a URL, or a path relative to `dir`) at `reference`
-fn git_docs(dir: &Path, git: &str, reference: &str) -> Result<Docs> {
-    let local_repo = dir.join(git);
-    let url = if local_repo.is_dir() {
+/// The docs git repository `git_repo` (a URL, or a path relative to `config_dir`) at `reference`
+fn git_docs(config_dir: &Path, git_repo: &str, reference: &str) -> Result<Docs> {
+    let local_repo = config_dir.join(git_repo);
+    let repo_url = if local_repo.is_dir() {
         local_repo
             .canonicalize()
-            .with_context(|| format!("resolving the docs repository {git}"))?
+            .with_context(|| format!("resolving the docs repository {git_repo}"))?
             .display()
             .to_string()
     } else {
-        git.to_owned()
+        git_repo.to_owned()
     };
-    let git_docs = GitDocs::open(&url, reference).with_context(|| format!("opening {url} at {reference}"))?;
+    let git_docs = GitDocs::open(&repo_url, reference).with_context(|| format!("opening {repo_url} at {reference}"))?;
     Ok(Docs::Git(git_docs))
 }
 
@@ -170,21 +172,21 @@ fn find_config() -> Result<PathBuf> {
     let working_dir = env::current_dir().context("getting the working directory")?;
     working_dir
         .ancestors()
-        .map(|dir| dir.join(CONFIG_FILE))
-        .find(|candidate| candidate.is_file())
-        .with_context(|| format!("no {CONFIG_FILE} in this directory or any parent (or pass --config)"))
+        .map(|ancestor_dir| ancestor_dir.join(CONFIG_FILE_NAME))
+        .find(|candidate_path| candidate_path.is_file())
+        .with_context(|| format!("no {CONFIG_FILE_NAME} in this directory or any parent (or pass --config)"))
 }
 
-fn git_root(dir: &Path) -> Result<PathBuf> {
-    let output = Command::new("git")
+fn git_root(inside_dir: &Path) -> Result<PathBuf> {
+    let rev_parse_output = Command::new("git")
         .arg("rev-parse")
         .arg("--show-toplevel")
-        .current_dir(dir)
+        .current_dir(inside_dir)
         .output()
         .context("running git rev-parse")?;
-    if !output.status.success() {
-        bail!("{} isn't inside a git checkout", dir.display());
+    if !rev_parse_output.status.success() {
+        bail!("{} isn't inside a git checkout", inside_dir.display());
     }
-    let root = String::from_utf8(output.stdout).context("reading git's output")?;
-    Ok(PathBuf::from(root.trim()))
+    let toplevel = String::from_utf8(rev_parse_output.stdout).context("reading git's output")?;
+    Ok(PathBuf::from(toplevel.trim()))
 }
