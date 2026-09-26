@@ -35,16 +35,16 @@ pub(crate) struct Assembly {
     pub modules: Vec<String>,
 }
 
-const HEADING: &str = r"^=+\s+(.+)";
-const SOURCE: &str = r"^\[source,\s*(\w+)";
+const HEADING_LINE: &str = r"^=+\s+(.+)";
+const SOURCE_BLOCK_START: &str = r"^\[source,\s*(\w+)";
 const INCLUDE_MODULE: &str = r"(?m)^include::modules/([\w.-]+)\.adoc\[";
-const TITLE: &str = r"(?m)^=\s+(.+)$";
+const DOCUMENT_TITLE: &str = r"(?m)^=\s+(.+)$";
 const LIST_MARKER: &str = r"^(\.+|\*+)\s+";
 const BLOCK_TITLE: &str = r"^\.(\S)";
-const CONDITIONAL: &str = r"^(ifdef|ifndef|endif)::";
-const SPACES: &str = r"\s+";
+const CONDITIONAL_DIRECTIVE: &str = r"^(ifdef|ifndef|endif)::";
+const WHITESPACE_RUN: &str = r"\s+";
 
-pub(crate) fn format_ref(module: &str, lang: &str, seq: usize) -> String {
+pub(crate) fn format_reference(module: &str, lang: &str, seq: usize) -> String {
     format!("{module}/{lang}-{seq:03}")
 }
 
@@ -58,16 +58,16 @@ pub(crate) fn read_assembly(docs: &Docs, path: &str) -> Result<Assembly> {
         .map(|captures| group(&captures, 1))
         .collect::<Result<Vec<_>>>()
         .with_context(|| format!("finding the modules {path} includes"))?;
-    let file_name = Path::new(path)
+    let file_stem = Path::new(path)
         .file_stem()
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_default();
-    let title = match regex!(TITLE)?.captures(&text) {
+    let title = match regex!(DOCUMENT_TITLE)?.captures(&text) {
         Some(captures) => group(&captures, 1)?.trim().to_owned(),
-        None => file_name.clone(),
+        None => file_stem.clone(),
     };
     Ok(Assembly {
-        id: file_name,
+        id: file_stem,
         path: path.to_owned(),
         title,
         modules: unique_in_order(included),
@@ -89,34 +89,41 @@ pub(crate) fn module_path(module: &str) -> String {
 }
 
 /// Lines that say nothing about the block below them
-fn is_filler(line: &str, conditional: &Regex) -> bool {
-    line.is_empty() || line == "+" || line.starts_with('[') || line.starts_with("//") || conditional.is_match(line)
+fn is_filler(line: &str, conditional_directive: &Regex) -> bool {
+    line.is_empty()
+        || line == "+"
+        || line.starts_with('[')
+        || line.starts_with("//")
+        || conditional_directive.is_match(line)
 }
 
-fn lead_for(lines: &[&str]) -> Result<Option<String>> {
-    let (heading, conditional) = (regex!(HEADING)?, regex!(CONDITIONAL)?);
-    let Some(line) = lines
+fn lead_for(lines_above: &[&str]) -> Result<Option<String>> {
+    let (heading_line, conditional_directive) = (regex!(HEADING_LINE)?, regex!(CONDITIONAL_DIRECTIVE)?);
+    let Some(nearest_line) = lines_above
         .iter()
         .rev()
         .map(|line| line.trim())
-        .find(|line| !is_filler(line, conditional))
+        .find(|line| !is_filler(line, conditional_directive))
     else {
         return Ok(None);
     };
-    if line.starts_with("----") || line.starts_with("....") || heading.is_match(line) {
+    if nearest_line.starts_with("----") || nearest_line.starts_with("....") || heading_line.is_match(nearest_line) {
         return Ok(None);
     }
-    let unlisted = regex!(LIST_MARKER)?.replace(line, "");
-    let untitled = regex!(BLOCK_TITLE)?.replace(&unlisted, "$1");
-    let lead = regex!(SPACES)?.replace_all(&untitled, " ").trim().to_owned();
+    let without_list_marker = regex!(LIST_MARKER)?.replace(nearest_line, "");
+    let without_title_dot = regex!(BLOCK_TITLE)?.replace(&without_list_marker, "$1");
+    let lead = regex!(WHITESPACE_RUN)?
+        .replace_all(&without_title_dot, " ")
+        .trim()
+        .to_owned();
     Ok((!lead.is_empty()).then_some(lead))
 }
 
 /// The next 1-based position for a block in `lang`
 fn next_seq(seq_by_lang: &mut BTreeMap<String, usize>, lang: &str) -> usize {
-    let count = seq_by_lang.entry(lang.to_owned()).or_insert(0);
-    *count += 1;
-    *count
+    let last_seq = seq_by_lang.entry(lang.to_owned()).or_insert(0);
+    *last_seq += 1;
+    *last_seq
 }
 
 /// A module's code blocks; none when the module doesn't exist
@@ -127,40 +134,40 @@ pub(crate) fn extract_blocks(docs: &Docs, module: &str) -> Result<Vec<Block>> {
     else {
         return Ok(vec![]);
     };
-    let (heading, source) = (regex!(HEADING)?, regex!(SOURCE)?);
+    let (heading_line, source_block_start) = (regex!(HEADING_LINE)?, regex!(SOURCE_BLOCK_START)?);
     let lines: Vec<&str> = text.split('\n').collect();
-    let is_delimiter = |index: &usize| lines.get(*index).is_some_and(|line| line.starts_with("----"));
+    let is_delimiter = |line_index: &usize| lines.get(*line_index).is_some_and(|line| line.starts_with("----"));
     let mut blocks = Vec::new();
     let mut seq_by_lang = BTreeMap::new();
     let mut section = None;
-    let mut index = 0;
-    while let Some(line) = lines.get(index) {
-        if let Some(heading_captures) = heading.captures(line) {
+    let mut line_index = 0;
+    while let Some(line) = lines.get(line_index) {
+        if let Some(heading_captures) = heading_line.captures(line) {
             section = Some(group(&heading_captures, 1)?.trim().to_owned());
         }
-        if let Some(source_captures) = source.captures(line) {
+        if let Some(source_captures) = source_block_start.captures(line) {
             let lang = group(&source_captures, 1)?.to_owned();
-            let lead = lead_for(lines.get(..index).unwrap_or_default())
-                .with_context(|| format!("finding the text introducing the block on line {}", index + 1))?;
-            let Some(open) = (index + 1..lines.len()).find(is_delimiter) else {
+            let lead = lead_for(lines.get(..line_index).unwrap_or_default())
+                .with_context(|| format!("finding the text introducing the block on line {}", line_index + 1))?;
+            let Some(open_delimiter) = (line_index + 1..lines.len()).find(is_delimiter) else {
                 break;
             };
-            let start = open + 1;
-            let close = (start..lines.len()).find(is_delimiter).unwrap_or(lines.len());
+            let content_start = open_delimiter + 1;
+            let close_delimiter = (content_start..lines.len()).find(is_delimiter).unwrap_or(lines.len());
             let seq = next_seq(&mut seq_by_lang, &lang);
             blocks.push(Block {
                 module: module.to_owned(),
-                reference: format_ref(module, &lang, seq),
+                reference: format_reference(module, &lang, seq),
                 lang,
                 seq,
-                content: lines.get(start..close).unwrap_or_default().join("\n") + "\n",
-                line: start + 1,
+                content: lines.get(content_start..close_delimiter).unwrap_or_default().join("\n") + "\n",
+                line: content_start + 1,
                 section: section.clone(),
                 lead,
             });
-            index = close;
+            line_index = close_delimiter;
         }
-        index += 1;
+        line_index += 1;
     }
     Ok(blocks)
 }
@@ -169,16 +176,16 @@ pub(crate) fn extract_blocks(docs: &Docs, module: &str) -> Result<Vec<Block>> {
 // Rendering support: the attributes a module needs when rendered on its own
 // ---------------------------------------------------------------------------
 
-const ATTRIBUTE: &str = r"^:([\w-]+):\s*(.*)$";
-const ATTRIBUTE_REF: &str = r"\{([\w-]+)\}";
+const ATTRIBUTE_ENTRY: &str = r"^:([\w-]+):\s*(.*)$";
+const ATTRIBUTE_REFERENCE: &str = r"\{([\w-]+)\}";
 const CONDITIONAL_BLOCK: &str = r"^(ifdef|ifndef|endif)::([\w,+-]*)\[\]\s*$";
 const ENTERPRISE_BRANCH: &str = r"^enterprise-(\d+)\.(\d+)$";
 
 /// Attributes a docs build would provide that don't make sense standalone
-const PRESENTATION: &[&str] = &["data-uri", "icons", "imagesdir", "toc", "toc-title", "experimental"];
+const PRESENTATION_ATTRIBUTES: &[&str] = &["data-uri", "icons", "imagesdir", "toc", "toc-title", "experimental"];
 
 /// Asciidoctor's built-in character replacement attributes
-const BUILT_IN: &[(&str, &str)] = &[("nbsp", "\u{a0}"), ("zwsp", "\u{200b}"), ("empty", ""), ("sp", " ")];
+const BUILT_IN_REPLACEMENTS: &[(&str, &str)] = &[("nbsp", "\u{a0}"), ("zwsp", "\u{200b}"), ("empty", ""), ("sp", " ")];
 
 /// How many levels of attributes referring to other attributes get resolved
 const RESOLVE_PASSES: usize = 5;
@@ -193,7 +200,7 @@ pub(crate) fn assembly_attributes(docs: &Docs, assembly: &str) -> Result<BTreeMa
         assembly.to_owned(),
     ])
     .context("prefetching the attribute files")?;
-    let mut attrs: BTreeMap<String, String> = distro_attributes(docs)
+    let mut attributes: BTreeMap<String, String> = distro_attributes(docs)
         .context("reading the product attributes")?
         .into_iter()
         .collect();
@@ -203,25 +210,25 @@ pub(crate) fn assembly_attributes(docs: &Docs, assembly: &str) -> Result<BTreeMa
         .with_context(|| format!("assembly {assembly} not found in the docs"))?;
     // Honor ifdef/ifndef blocks the way a docs build for the distro
     // (openshift-enterprise) would
-    attrs.insert("openshift-enterprise".to_owned(), String::new());
-    add_header_attributes(docs, assembly, &text, &mut attrs)?;
-    attrs.retain(|name, _| !PRESENTATION.contains(&name.as_str()));
-    resolve_references(attrs).context("resolving attribute references")
+    attributes.insert("openshift-enterprise".to_owned(), String::new());
+    add_header_attributes(docs, assembly, &text, &mut attributes)?;
+    attributes.retain(|name, _| !PRESENTATION_ATTRIBUTES.contains(&name.as_str()));
+    resolve_references(attributes).context("resolving attribute references")
 }
 
 /// Product title and version, from `_distro_map.yml`
 fn distro_attributes(docs: &Docs) -> Result<Vec<(String, String)>> {
-    let Some(distro) = docs.read("_distro_map.yml").context("reading _distro_map.yml")? else {
+    let Some(distro_map_text) = docs.read("_distro_map.yml").context("reading _distro_map.yml")? else {
         return Ok(vec![]);
     };
-    let distro: Value = serde_yaml::from_str(&distro).context("parsing _distro_map.yml")?;
-    let enterprise = distro.get("openshift-enterprise");
-    let product_title = enterprise
-        .and_then(|enterprise| enterprise.get("name"))
+    let distro_map: Value = serde_yaml::from_str(&distro_map_text).context("parsing _distro_map.yml")?;
+    let enterprise_distro = distro_map.get("openshift-enterprise");
+    let product_title = enterprise_distro
+        .and_then(|enterprise_distro| enterprise_distro.get("name"))
         .and_then(Value::as_str)
         .map(|name| ("product-title".to_owned(), name.to_owned()));
-    let product_version = enterprise
-        .and_then(|enterprise| enterprise.get("branches"))
+    let product_version = enterprise_distro
+        .and_then(|enterprise_distro| enterprise_distro.get("branches"))
         .and_then(Value::as_mapping)
         .map(latest_enterprise_version)
         .transpose()
@@ -254,19 +261,29 @@ fn latest_enterprise_version(branches: &Mapping) -> Result<Option<(u32, u32)>> {
 
 /// The attribute entries above the assembly's first module, and those in the
 /// attribute files it includes there
-fn add_header_attributes(docs: &Docs, assembly: &str, text: &str, attrs: &mut BTreeMap<String, String>) -> Result<()> {
-    let attribute = regex!(ATTRIBUTE)?;
+fn add_header_attributes(
+    docs: &Docs,
+    assembly: &str,
+    text: &str,
+    attributes: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    let attribute_entry = regex!(ATTRIBUTE_ENTRY)?;
     for line in text.lines().take_while(|line| !line.starts_with("include::modules/")) {
-        if let Some(rest) = line.strip_prefix("include::") {
-            if let Some(file) = rest.split('[').next().filter(|file| file.starts_with("_attributes/")) {
-                let included = docs
-                    .read(file)
-                    .with_context(|| format!("reading {file}"))?
+        if let Some(include_target) = line.strip_prefix("include::") {
+            if let Some(attribute_file) = include_target
+                .split('[')
+                .next()
+                .filter(|attribute_file| attribute_file.starts_with("_attributes/"))
+            {
+                let attribute_file_text = docs
+                    .read(attribute_file)
+                    .with_context(|| format!("reading {attribute_file}"))?
                     .unwrap_or_default();
-                add_attribute_entries(&included, attrs).with_context(|| format!("reading the attributes in {file}"))?;
+                add_attribute_entries(&attribute_file_text, attributes)
+                    .with_context(|| format!("reading the attributes in {attribute_file}"))?;
             }
-        } else if attribute.is_match(line) {
-            add_attribute_entries(line, attrs).with_context(|| format!("reading the attributes in {assembly}"))?;
+        } else if attribute_entry.is_match(line) {
+            add_attribute_entries(line, attributes).with_context(|| format!("reading the attributes in {assembly}"))?;
         }
     }
     Ok(())
@@ -274,27 +291,27 @@ fn add_header_attributes(docs: &Docs, assembly: &str, text: &str, attrs: &mut BT
 
 /// Adds the attribute entries in `text`, skipping those in ifdef/ifndef blocks
 /// whose condition doesn't hold
-fn add_attribute_entries(text: &str, attrs: &mut BTreeMap<String, String>) -> Result<()> {
-    let (conditional_block, attribute) = (regex!(CONDITIONAL_BLOCK)?, regex!(ATTRIBUTE)?);
-    let mut active: Vec<bool> = Vec::new();
+fn add_attribute_entries(text: &str, attributes: &mut BTreeMap<String, String>) -> Result<()> {
+    let (conditional_block, attribute_entry) = (regex!(CONDITIONAL_BLOCK)?, regex!(ATTRIBUTE_ENTRY)?);
+    let mut enclosing_conditions: Vec<bool> = Vec::new();
     for line in text.lines() {
         if let Some(captures) = conditional_block.captures(line) {
-            let defined = group(&captures, 2)?
+            let any_defined = group(&captures, 2)?
                 .split([',', '+'])
-                .any(|name| attrs.contains_key(name));
+                .any(|name| attributes.contains_key(name));
             match group(&captures, 1)? {
-                "ifdef" => active.push(defined),
-                "ifndef" => active.push(!defined),
+                "ifdef" => enclosing_conditions.push(any_defined),
+                "ifndef" => enclosing_conditions.push(!any_defined),
                 _ => {
-                    active.pop();
+                    enclosing_conditions.pop();
                 }
             }
             continue;
         }
-        if active.iter().all(|is_active| *is_active)
-            && let Some(captures) = attribute.captures(line)
+        if enclosing_conditions.iter().all(|is_active| *is_active)
+            && let Some(captures) = attribute_entry.captures(line)
         {
-            attrs.insert(group(&captures, 1)?.to_owned(), group(&captures, 2)?.to_owned());
+            attributes.insert(group(&captures, 1)?.to_owned(), group(&captures, 2)?.to_owned());
         }
     }
     Ok(())
@@ -302,28 +319,30 @@ fn add_attribute_entries(text: &str, attrs: &mut BTreeMap<String, String>) -> Re
 
 /// Replaces references to other attributes (and Asciidoctor's built-in
 /// character replacements) with their values, as a docs build would
-fn resolve_references(attrs: BTreeMap<String, String>) -> Result<BTreeMap<String, String>> {
-    let attribute_ref = regex!(ATTRIBUTE_REF)?;
-    Ok((0..RESOLVE_PASSES).fold(attrs, |attrs, _| resolve_once(attribute_ref, &attrs)))
+fn resolve_references(attributes: BTreeMap<String, String>) -> Result<BTreeMap<String, String>> {
+    let attribute_reference = regex!(ATTRIBUTE_REFERENCE)?;
+    Ok((0..RESOLVE_PASSES).fold(attributes, |attributes, _| {
+        resolve_once(attribute_reference, &attributes)
+    }))
 }
 
 /// One pass of [`resolve_references`]: each reference replaced by the value it had before the pass
-fn resolve_once(attribute_ref: &Regex, attrs: &BTreeMap<String, String>) -> BTreeMap<String, String> {
-    let known: BTreeMap<&str, &str> = BUILT_IN
+fn resolve_once(attribute_reference: &Regex, attributes: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    let known_values: BTreeMap<&str, &str> = BUILT_IN_REPLACEMENTS
         .iter()
         .copied()
-        .chain(attrs.iter().map(|(name, value)| (name.as_str(), value.as_str())))
+        .chain(attributes.iter().map(|(name, value)| (name.as_str(), value.as_str())))
         .collect();
-    attrs
+    attributes
         .iter()
         .map(|(name, value)| {
-            let resolved = attribute_ref.replace_all(value, |captures: &Captures<'_>| {
-                let whole = captures.get(0).map_or("", |reference| reference.as_str());
+            let resolved = attribute_reference.replace_all(value, |captures: &Captures<'_>| {
+                let whole_reference = captures.get(0).map_or("", |reference| reference.as_str());
                 captures
                     .get(1)
-                    .and_then(|referenced| known.get(referenced.as_str()))
+                    .and_then(|referenced_name| known_values.get(referenced_name.as_str()))
                     .copied()
-                    .unwrap_or(whole)
+                    .unwrap_or(whole_reference)
                     .to_owned()
             });
             (name.clone(), resolved.into_owned())

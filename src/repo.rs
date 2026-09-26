@@ -12,16 +12,16 @@ use std::process::Command;
 use std::sync::Arc;
 
 /// Files whose comments start with `#`, so they can carry markers
-const HASH_COMMENT_EXT: &[&str] = &[
+const HASH_COMMENT_EXTENSIONS: &[&str] = &[
     "", "yaml", "yml", "sh", "bash", "conf", "cfg", "env", "py", "ini", "toml",
 ];
-const OTHER_TEXT_EXT: &[&str] = &["txt", "j2", "tpl", "template"];
-const MAX_SIZE: u64 = 256 * 1024;
+const OTHER_TEXT_EXTENSIONS: &[&str] = &["txt", "j2", "tpl", "template"];
+const MAX_SCANNED_FILE_SIZE: u64 = 256 * 1024;
 
-fn ext(file: &str) -> &str {
-    let name = file.rsplit('/').next().unwrap_or(file);
-    match name.rsplit_once('.') {
-        Some((stem, ext)) if !stem.is_empty() => ext,
+fn extension(file: &str) -> &str {
+    let file_name = file.rsplit('/').next().unwrap_or(file);
+    match file_name.rsplit_once('.') {
+        Some((stem, extension)) if !stem.is_empty() => extension,
         _ => "",
     }
 }
@@ -31,7 +31,7 @@ fn is_makefile(file: &str) -> bool {
 }
 
 pub(crate) fn can_hold_markers(file: &str) -> bool {
-    HASH_COMMENT_EXT.contains(&ext(file)) || is_makefile(file)
+    HASH_COMMENT_EXTENSIONS.contains(&extension(file)) || is_makefile(file)
 }
 
 /// Text files tracked (or untracked but not ignored) in the repo, minus excluded paths
@@ -50,14 +50,14 @@ fn repo_files(config: &AsadocConfig) -> Result<Vec<String>> {
     let listing = String::from_utf8_lossy(&output.stdout);
     listing
         .lines()
-        .filter(|file| !file.is_empty() && !file.split('/').any(|part| part == "node_modules"))
+        .filter(|file| !file.is_empty() && !file.split('/').any(|path_component| path_component == "node_modules"))
         .filter(|file| {
             !config
                 .exclude
                 .iter()
                 .any(|excluded| file.starts_with(excluded.as_str()))
         })
-        .filter(|file| can_hold_markers(file) || OTHER_TEXT_EXT.contains(&ext(file)))
+        .filter(|file| can_hold_markers(file) || OTHER_TEXT_EXTENSIONS.contains(&extension(file)))
         .map(|file| Ok(is_small_file(&config.repo_root.join(file))?.then(|| file.to_owned())))
         .filter_map(Result::transpose)
         .collect()
@@ -66,7 +66,7 @@ fn repo_files(config: &AsadocConfig) -> Result<Vec<String>> {
 /// Whether `path` is a regular file small enough to scan; false when it's gone
 fn is_small_file(path: &Path) -> Result<bool> {
     match fs::metadata(path) {
-        Ok(metadata) => Ok(metadata.is_file() && metadata.len() < MAX_SIZE),
+        Ok(metadata) => Ok(metadata.is_file() && metadata.len() < MAX_SCANNED_FILE_SIZE),
         // Deleted, but still in the index
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error).with_context(|| format!("inspecting {}", path.display())),
@@ -74,8 +74,8 @@ fn is_small_file(path: &Path) -> Result<bool> {
 }
 
 /// A repo file's text; None when it's gone or isn't text
-pub(crate) fn read(root: &Path, file: &str) -> Result<Option<String>> {
-    let path = root.join(file);
+pub(crate) fn read(repo_root: &Path, file: &str) -> Result<Option<String>> {
+    let path = repo_root.join(file);
     match fs::read_to_string(&path) {
         Ok(text) => Ok(Some(text)),
         Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::InvalidData) => Ok(None),
@@ -130,9 +130,9 @@ fn code_id(file: &str, section: Option<&str>) -> String {
 }
 
 /// A marked file or section, before its code-side options are applied
-struct RawMarked<'a> {
+struct UnappliedMarkedCode<'a> {
     section: Option<&'a str>,
-    raw: String,
+    unapplied_content: String,
     options: &'a [MarkerOption],
     lines: Option<(usize, usize)>,
     marker_lines: Vec<usize>,
@@ -155,46 +155,47 @@ pub(crate) fn scan(config: &AsadocConfig) -> Result<Scan> {
 
 /// Adds a file's marked code, and the problems with its markers, to `scan`
 fn scan_file(scan: &mut Scan, file: String, text: String) -> Result<()> {
-    let found = markers::parse_markers(&text).with_context(|| format!("finding markers in {file}"))?;
-    scan.problems.extend(found.problems.iter().map(|message| Problem {
-        file: file.clone(),
-        message: message.clone(),
-    }));
-    if let Some(header) = &found.file {
+    let parsed_markers = markers::parse_markers(&text).with_context(|| format!("finding markers in {file}"))?;
+    scan.problems
+        .extend(parsed_markers.problems.iter().map(|message| Problem {
+            file: file.clone(),
+            message: message.clone(),
+        }));
+    if let Some(header) = &parsed_markers.file {
         add_marked(scan, &file, marked_file(&text, header)?)
             .with_context(|| format!("reading the file marked in {file}"))?;
     }
-    for section in found.sections.values() {
+    for section in parsed_markers.sections.values() {
         add_marked(scan, &file, marked_section(&text, section)?)
             .with_context(|| format!("reading section \"{}\" of {file}", section.name))?;
     }
     scan.files.push(RepoFile {
         file,
         text,
-        markers: found,
+        markers: parsed_markers,
     });
     Ok(())
 }
 
 /// The whole file, minus its file marker
-fn marked_file<'a>(text: &str, header: &'a Header) -> Result<RawMarked<'a>> {
-    let before = text
+fn marked_file<'a>(text: &str, header: &'a Header) -> Result<UnappliedMarkedCode<'a>> {
+    let before_marker = text
         .get(..header.marker_from)
         .context("file marker starts outside the file")?;
-    let after = text
+    let after_marker = text
         .get(header.marker_to..)
         .context("file marker ends outside the file")?;
     // Marked content is whole lines, like a doc block's: a file's last
     // line counts as ending with a newline even when the file doesn't
-    let joined = format!("{before}{after}");
-    let raw = if joined.is_empty() || joined.ends_with('\n') {
-        joined
+    let without_marker = format!("{before_marker}{after_marker}");
+    let unapplied_content = if without_marker.is_empty() || without_marker.ends_with('\n') {
+        without_marker
     } else {
-        joined + "\n"
+        without_marker + "\n"
     };
-    Ok(RawMarked {
+    Ok(UnappliedMarkedCode {
         section: None,
-        raw,
+        unapplied_content,
         options: &header.options,
         lines: None,
         marker_lines: (header.start_line..=header.last_line).collect(),
@@ -202,13 +203,13 @@ fn marked_file<'a>(text: &str, header: &'a Header) -> Result<RawMarked<'a>> {
 }
 
 /// The lines between a section's markers
-fn marked_section<'a>(text: &str, section: &'a Section) -> Result<RawMarked<'a>> {
-    let raw = text
+fn marked_section<'a>(text: &str, section: &'a Section) -> Result<UnappliedMarkedCode<'a>> {
+    let unapplied_content = text
         .get(section.from..section.to)
         .with_context(|| format!("section \"{}\" is outside the file", section.name))?;
-    Ok(RawMarked {
+    Ok(UnappliedMarkedCode {
         section: Some(&section.name),
-        raw: raw.to_owned(),
+        unapplied_content: unapplied_content.to_owned(),
         options: &section.header.options,
         lines: Some((section.header.last_line + 1, section.end_line - 1)),
         marker_lines: (section.header.start_line..=section.header.last_line)
@@ -218,15 +219,16 @@ fn marked_section<'a>(text: &str, section: &'a Section) -> Result<RawMarked<'a>>
 }
 
 /// Adds the marked code to `scan`, or a problem when its options can't be applied
-fn add_marked(scan: &mut Scan, file: &str, marked: RawMarked<'_>) -> Result<()> {
-    let (code_side, doc_side): (Vec<_>, Vec<_>) = marked
+fn add_marked(scan: &mut Scan, file: &str, marked: UnappliedMarkedCode<'_>) -> Result<()> {
+    let (repo_side_options, doc_side_options): (Vec<_>, Vec<_>) = marked
         .options
         .iter()
         .cloned()
         .partition(|option| option.side == Side::Repo);
-    match markers::apply_options(&marked.raw, &code_side) {
+    match markers::apply_options(&marked.unapplied_content, &repo_side_options) {
         Ok(content) => {
-            let placeholders = markers::placeholders(&code_side, &content).context("finding the placeholders")?;
+            let placeholders =
+                markers::placeholders(&repo_side_options, &content).context("finding the placeholders")?;
             let matcher = Matcher::new(&content, &placeholders).context("compiling the code for matching")?;
             scan.marked.push(MarkedCode {
                 matcher: Arc::new(matcher),
@@ -235,8 +237,8 @@ fn add_marked(scan: &mut Scan, file: &str, marked: RawMarked<'_>) -> Result<()> 
                 section: marked.section.map(str::to_owned),
                 content,
                 placeholders,
-                options: code_side,
-                doc_options: doc_side,
+                options: repo_side_options,
+                doc_options: doc_side_options,
                 lines: marked.lines,
                 marker_lines: marked.marker_lines,
             });

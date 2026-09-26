@@ -22,9 +22,9 @@ pub(crate) struct GitDocs {
     pub url: String,
     pub reference: String,
     pub commit: String,
-    dir: PathBuf,
+    clone_dir: PathBuf,
     /// Files read so far (the commit never changes, so neither do they)
-    files: Mutex<HashMap<String, Option<String>>>,
+    file_cache: Mutex<HashMap<String, Option<String>>>,
 }
 
 impl Docs {
@@ -32,11 +32,11 @@ impl Docs {
     pub(crate) fn read(&self, path: &str) -> Result<Option<String>> {
         match self {
             Self::Local(root) => {
-                let full = root.join(path);
-                match fs::read_to_string(&full) {
+                let full_path = root.join(path);
+                match fs::read_to_string(&full_path) {
                     Ok(text) => Ok(Some(text)),
                     Err(error) if error.kind() == ErrorKind::NotFound => Ok(None),
-                    Err(error) => Err(error).with_context(|| format!("reading {}", full.display())),
+                    Err(error) => Err(error).with_context(|| format!("reading {}", full_path.display())),
                 }
             }
             Self::Git(git_docs) => git_docs
@@ -61,8 +61,8 @@ impl Docs {
         match self {
             Self::Local(root) => root.display().to_string(),
             Self::Git(git_docs) => {
-                let short: String = git_docs.commit.chars().take(12).collect();
-                format!("{} at {} ({short})", git_docs.url, git_docs.reference)
+                let short_commit: String = git_docs.commit.chars().take(12).collect();
+                format!("{} at {} ({short_commit})", git_docs.url, git_docs.reference)
             }
         }
     }
@@ -78,32 +78,33 @@ impl Docs {
     /// Base URL for links to docs files, for GitHub repositories
     pub(crate) fn default_link_base(&self) -> Option<String> {
         let Self::Git(git_docs) = self else { return None };
-        let repo = git_docs.url.strip_suffix(".git").unwrap_or(&git_docs.url);
-        repo.starts_with("https://github.com/")
-            .then(|| format!("{repo}/blob/{}/", git_docs.commit))
+        let repo_url = git_docs.url.strip_suffix(".git").unwrap_or(&git_docs.url);
+        repo_url
+            .starts_with("https://github.com/")
+            .then(|| format!("{repo_url}/blob/{}/", git_docs.commit))
     }
 }
 
-fn run_git(dir: &Path, args: &[&str]) -> Result<Output> {
+fn run_git(repo_dir: &Path, args: &[&str]) -> Result<Output> {
     Command::new("git")
         .arg("-C")
-        .arg(dir)
+        .arg(repo_dir)
         .args(args)
         .output()
         .with_context(|| format!("running git {}", args.join(" ")))
 }
 
 /// Runs git in `dir`: its output, or None when it exits unsuccessfully
-fn try_git(dir: &Path, args: &[&str]) -> Result<Option<String>> {
-    let output = run_git(dir, args)?;
+fn try_git_stdout(repo_dir: &Path, args: &[&str]) -> Result<Option<String>> {
+    let output = run_git(repo_dir, args)?;
     Ok(output
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).into_owned()))
 }
 
-fn git(dir: &Path, args: &[&str]) -> Result<String> {
-    let output = run_git(dir, args)?;
+fn git_stdout(repo_dir: &Path, args: &[&str]) -> Result<String> {
+    let output = run_git(repo_dir, args)?;
     if !output.status.success() {
         bail!(
             "git {} failed: {}",
@@ -123,8 +124,8 @@ fn cache_dir() -> PathBuf {
 }
 
 /// Where the clone of `url` lives in the cache
-fn clone_dir(url: &str) -> PathBuf {
-    let name: String = url
+fn cached_clone_dir(url: &str) -> PathBuf {
+    let dir_name: String = url
         .chars()
         .map(|character| {
             if character.is_ascii_alphanumeric() {
@@ -134,12 +135,12 @@ fn clone_dir(url: &str) -> PathBuf {
             }
         })
         .collect();
-    cache_dir().join("docs").join(name)
+    cache_dir().join("docs").join(dir_name)
 }
 
 /// Makes `dir` a bare, blobless clone of `url` with nothing fetched yet
-fn init_clone(dir: &Path, url: &str) -> Result<()> {
-    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+fn init_clone(clone_dir: &Path, url: &str) -> Result<()> {
+    fs::create_dir_all(clone_dir).with_context(|| format!("creating {}", clone_dir.display()))?;
     [
         ["init", "--quiet", "--bare"].as_slice(),
         &["remote", "add", "origin", url],
@@ -147,17 +148,17 @@ fn init_clone(dir: &Path, url: &str) -> Result<()> {
         &["config", "remote.origin.partialclonefilter", "blob:none"],
     ]
     .into_iter()
-    .try_for_each(|args| git(dir, args).map(drop))
+    .try_for_each(|args| git_stdout(clone_dir, args).map(drop))
 }
 
 /// Whether `reference` is a full commit hash already in the clone. Such a
 /// commit can't have changed, so there's no need to ask the remote
-fn has_pinned_commit(dir: &Path, reference: &str) -> bool {
-    let pinned = reference.len() == 40 && reference.chars().all(|character| character.is_ascii_hexdigit());
-    pinned
+fn has_pinned_commit(clone_dir: &Path, reference: &str) -> bool {
+    let is_full_hash = reference.len() == 40 && reference.chars().all(|character| character.is_ascii_hexdigit());
+    is_full_hash
         && Command::new("git")
             .arg("-C")
-            .arg(dir)
+            .arg(clone_dir)
             .args(["cat-file", "-e", &format!("{reference}^{{commit}}")])
             .env("GIT_NO_LAZY_FETCH", "1")
             .output()
@@ -165,9 +166,9 @@ fn has_pinned_commit(dir: &Path, reference: &str) -> bool {
 }
 
 /// Fetches just `reference` (depth 1, no blobs): the commit it points to
-fn fetch_commit(dir: &Path, url: &str, reference: &str) -> Result<String> {
-    git(
-        dir,
+fn fetch_commit(clone_dir: &Path, url: &str, reference: &str) -> Result<String> {
+    git_stdout(
+        clone_dir,
         &[
             "fetch",
             "--quiet",
@@ -179,7 +180,7 @@ fn fetch_commit(dir: &Path, url: &str, reference: &str) -> Result<String> {
         ],
     )
     .with_context(|| format!("fetching {reference} of {url}"))?;
-    Ok(git(dir, &["rev-parse", "FETCH_HEAD"])
+    Ok(git_stdout(clone_dir, &["rev-parse", "FETCH_HEAD"])
         .context("resolving the fetched commit")?
         .trim()
         .to_owned())
@@ -188,71 +189,76 @@ fn fetch_commit(dir: &Path, url: &str, reference: &str) -> Result<String> {
 impl GitDocs {
     /// Fetches `reference` (a branch, tag or commit) of `url` into the cache
     pub(crate) fn open(url: &str, reference: &str) -> Result<Self> {
-        let dir = clone_dir(url);
-        if !dir.join("HEAD").exists() {
-            init_clone(&dir, url).with_context(|| format!("setting up the docs cache in {}", dir.display()))?;
-            eprintln!("asadoc: fetching {url} at {reference} into {}", dir.display());
+        let clone_dir = cached_clone_dir(url);
+        if !clone_dir.join("HEAD").exists() {
+            init_clone(&clone_dir, url)
+                .with_context(|| format!("setting up the docs cache in {}", clone_dir.display()))?;
+            eprintln!("asadoc: fetching {url} at {reference} into {}", clone_dir.display());
         }
-        let commit = if has_pinned_commit(&dir, reference) {
+        let commit = if has_pinned_commit(&clone_dir, reference) {
             reference.to_owned()
         } else {
-            fetch_commit(&dir, url, reference)?
+            fetch_commit(&clone_dir, url, reference)?
         };
         Ok(Self {
             url: url.to_owned(),
             reference: reference.to_owned(),
             commit,
-            dir,
-            files: Mutex::new(HashMap::new()),
+            clone_dir,
+            file_cache: Mutex::new(HashMap::new()),
         })
     }
 
-    fn files(&self) -> Result<MutexGuard<'_, HashMap<String, Option<String>>>> {
-        self.files
+    fn lock_file_cache(&self) -> Result<MutexGuard<'_, HashMap<String, Option<String>>>> {
+        self.file_cache
             .lock()
             .map_err(|error| anyhow!("{error}"))
             .context("locking the docs file cache")
     }
 
     fn read(&self, path: &str) -> Result<Option<String>> {
-        if let Some(cached) = self.files()?.get(path) {
+        if let Some(cached) = self.lock_file_cache()?.get(path) {
             return Ok(cached.clone());
         }
         // Resolving the path only needs trees, which the blobless clone has, so
         // a failure here means there's no such file
-        let spec = format!("{}:{path}", self.commit);
-        let text = try_git(&self.dir, &["rev-parse", "--verify", "--quiet", &spec])
+        let object_spec = format!("{}:{path}", self.commit);
+        let text = try_git_stdout(&self.clone_dir, &["rev-parse", "--verify", "--quiet", &object_spec])
             .context("looking the file up")?
-            .map(|oid| git(&self.dir, &["cat-file", "blob", oid.trim()]).context("reading the file's blob"))
+            .map(|blob_oid| {
+                git_stdout(&self.clone_dir, &["cat-file", "blob", blob_oid.trim()]).context("reading the file's blob")
+            })
             .transpose()?;
-        self.files()?.insert(path.to_owned(), text.clone());
+        self.lock_file_cache()?.insert(path.to_owned(), text.clone());
         Ok(text)
     }
 
     fn prefetch(&self, paths: &[String]) -> Result<()> {
-        let wanted: Vec<&str> = {
-            let files = self.files()?;
+        let uncached_paths: Vec<&str> = {
+            let file_cache = self.lock_file_cache()?;
             paths
                 .iter()
                 .map(String::as_str)
-                .filter(|path| !files.contains_key(*path))
+                .filter(|path| !file_cache.contains_key(*path))
                 .collect()
         };
-        if wanted.is_empty() {
+        if uncached_paths.is_empty() {
             return Ok(());
         }
         let ls_tree_args: Vec<&str> = ["ls-tree", "-r", self.commit.as_str(), "--"]
             .into_iter()
-            .chain(wanted)
+            .chain(uncached_paths)
             .collect();
-        let listing = git(&self.dir, &ls_tree_args).context("listing the files to fetch")?;
+        let tree_listing = git_stdout(&self.clone_dir, &ls_tree_args).context("listing the files to fetch")?;
         // "<mode> blob <oid>\t<path>"
-        let oids: Vec<&str> = listing
+        let blob_oids: Vec<&str> = tree_listing
             .lines()
-            .filter_map(|entry| entry.split_whitespace().nth(2))
+            .filter_map(|tree_entry| tree_entry.split_whitespace().nth(2))
             .collect();
-        let missing = self.missing(&oids).context("finding the blobs not fetched yet")?;
-        if missing.is_empty() {
+        let missing_oids = self
+            .missing_objects(&blob_oids)
+            .context("finding the blobs not fetched yet")?;
+        if missing_oids.is_empty() {
             return Ok(());
         }
         let fetch_args: Vec<&str> = [
@@ -266,17 +272,17 @@ impl GitDocs {
             "origin",
         ]
         .into_iter()
-        .chain(missing)
+        .chain(missing_oids)
         .collect();
-        git(&self.dir, &fetch_args).context("fetching the blobs")?;
+        git_stdout(&self.clone_dir, &fetch_args).context("fetching the blobs")?;
         Ok(())
     }
 
     /// The objects not in the cache yet (checked without fetching them)
-    fn missing<'a>(&self, oids: &[&'a str]) -> Result<Vec<&'a str>> {
-        let mut child = Command::new("git")
+    fn missing_objects<'a>(&self, oids: &[&'a str]) -> Result<Vec<&'a str>> {
+        let mut cat_file = Command::new("git")
             .arg("-C")
-            .arg(&self.dir)
+            .arg(&self.clone_dir)
             .args(["cat-file", "--batch-check"])
             .env("GIT_NO_LAZY_FETCH", "1")
             .stdin(Stdio::piped())
@@ -285,21 +291,21 @@ impl GitDocs {
             .context("running git cat-file --batch-check")?;
         // Dropped at the end of the block, closing git's stdin
         {
-            let mut stdin = child.stdin.take().context("git cat-file has no stdin")?;
+            let mut stdin = cat_file.stdin.take().context("git cat-file has no stdin")?;
             stdin
                 .write_all(oids.join("\n").as_bytes())
                 .context("writing the object IDs to git cat-file")?;
         }
-        let output = child.wait_with_output().context("waiting for git cat-file")?;
+        let output = cat_file.wait_with_output().context("waiting for git cat-file")?;
         if !output.status.success() {
             bail!("git cat-file --batch-check failed");
         }
         // "<oid> missing" for each one that isn't there
-        let report = String::from_utf8_lossy(&output.stdout);
-        let absent: HashSet<&str> = report
+        let batch_check_output = String::from_utf8_lossy(&output.stdout);
+        let absent_oids: HashSet<&str> = batch_check_output
             .lines()
             .filter_map(|line| line.strip_suffix(" missing"))
             .collect();
-        Ok(oids.iter().copied().filter(|oid| absent.contains(oid)).collect())
+        Ok(oids.iter().copied().filter(|oid| absent_oids.contains(oid)).collect())
     }
 }
