@@ -10,7 +10,7 @@
 //!     assemblies: [...]
 //! ```
 
-use crate::source::{Docs, GitDocs};
+use crate::source::{DocsSource, GitDocs};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use std::env;
@@ -32,7 +32,7 @@ struct RawAsadocConfig {
     exclude: Vec<String>,
     /// Base URLs for "source" links in the UI
     #[serde(default)]
-    links: Links,
+    links: SourceLinkBases,
 }
 
 /// The docs, keyed by format
@@ -62,7 +62,7 @@ fn default_ignore_dir() -> PathBuf {
 
 #[derive(Deserialize, Default, Clone, Serialize)]
 #[serde(deny_unknown_fields)]
-pub(crate) struct Links {
+pub(crate) struct SourceLinkBases {
     /// e.g. <https://github.com/org/repo/blob/main>/
     pub repo: Option<String>,
     /// e.g. <https://github.com/org/docs/blob/main>/ (default for GitHub docs
@@ -73,11 +73,11 @@ pub(crate) struct Links {
 pub(crate) struct AsadocConfig {
     /// The git checkout the config file is in: where marked code is looked for
     pub repo_root: PathBuf,
-    pub docs: Docs,
+    pub docs: DocsSource,
     pub assemblies: Vec<String>,
     pub ignore_dir: PathBuf,
     pub exclude: Vec<String>,
-    pub links: Links,
+    pub links: SourceLinkBases,
 }
 
 impl AsadocConfig {
@@ -101,7 +101,7 @@ impl AsadocConfig {
             Some(docs_dir) => local_docs(docs_dir).context("opening the --docs checkout")?,
             None => configured_docs(&config_path, &config_dir, &raw_config.docs.asciidoc)?,
         };
-        let links = Links {
+        let links = SourceLinkBases {
             docs: raw_config.links.docs.or_else(|| docs.default_link_base()),
             ..raw_config.links
         };
@@ -124,7 +124,7 @@ impl AsadocConfig {
 }
 
 /// The docs the config file at `config_path` (in `config_dir`) points to
-fn configured_docs(config_path: &Path, config_dir: &Path, raw_asciidoc: &RawAsciidoc) -> Result<Docs> {
+fn configured_docs(config_path: &Path, config_dir: &Path, raw_asciidoc: &RawAsciidoc) -> Result<DocsSource> {
     match (&raw_asciidoc.path, &raw_asciidoc.git, &raw_asciidoc.reference) {
         (Some(local_path), None, None) => {
             local_docs(&config_dir.join(local_path)).context("opening the configured docs checkout")
@@ -142,18 +142,18 @@ fn configured_docs(config_path: &Path, config_dir: &Path, raw_asciidoc: &RawAsci
 }
 
 /// A local docs checkout at `docs_root`
-fn local_docs(docs_root: &Path) -> Result<Docs> {
+fn local_docs(docs_root: &Path) -> Result<DocsSource> {
     if !docs_root.is_dir() {
         bail!("docs checkout not found at {}", docs_root.display());
     }
     let docs_root = docs_root
         .canonicalize()
         .with_context(|| format!("resolving the docs checkout {}", docs_root.display()))?;
-    Ok(Docs::Local(docs_root))
+    Ok(DocsSource::Local(docs_root))
 }
 
 /// The docs git repository `git_repo` (a URL, or a path relative to `config_dir`) at `reference`
-fn git_docs(config_dir: &Path, git_repo: &str, reference: &str) -> Result<Docs> {
+fn git_docs(config_dir: &Path, git_repo: &str, reference: &str) -> Result<DocsSource> {
     let local_repo = config_dir.join(git_repo);
     let repo_url = if local_repo.is_dir() {
         local_repo
@@ -165,7 +165,7 @@ fn git_docs(config_dir: &Path, git_repo: &str, reference: &str) -> Result<Docs> 
         git_repo.to_owned()
     };
     let git_docs = GitDocs::open(&repo_url, reference).with_context(|| format!("opening {repo_url} at {reference}"))?;
-    Ok(Docs::Git(git_docs))
+    Ok(DocsSource::Git(git_docs))
 }
 
 fn find_config() -> Result<PathBuf> {

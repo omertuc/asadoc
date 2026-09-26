@@ -8,7 +8,7 @@ use similar::TextDiff;
 
 use crate::config::AsadocConfig;
 use crate::eval::Evaluation;
-use crate::repo::Problem;
+use crate::repo::MarkerProblem;
 use crate::report::{
     self, CheckOutcome, CheckSummary, Closest, FixOutcome, LineDiff, Sides, UnresolvedInAssembly, UnusedCode,
 };
@@ -20,16 +20,16 @@ fn plural(count: usize, singular: &str, plural_form: &str) -> String {
 
 /// A line difference, in words
 fn describe_line_diff(line_diff: LineDiff) -> String {
-    let doc_lines_in_words = plural(line_diff.doc_line_count, "line", "lines");
+    let doc_line_count_phrase = plural(line_diff.doc_line_count, "line", "lines");
     match (
         line_diff.differing_lines,
         line_diff.extra_code_lines.saturating_sub(line_diff.differing_lines),
     ) {
         (0, 0) => "same lines, but not the same text (line endings or placeholders)".to_owned(),
         (0, more_code_lines) => format!("the code has {} more", plural(more_code_lines, "line", "lines")),
-        (differing_lines, 0) => format!("{differing_lines} of {doc_lines_in_words} differ"),
+        (differing_lines, 0) => format!("{differing_lines} of {doc_line_count_phrase} differ"),
         (differing_lines, more_code_lines) => {
-            format!("{differing_lines} of {doc_lines_in_words} differ, and the code has {more_code_lines} more")
+            format!("{differing_lines} of {doc_line_count_phrase} differ, and the code has {more_code_lines} more")
         }
     }
 }
@@ -150,7 +150,7 @@ fn print_stale_ignored(stale_ignored: &[(String, String)]) {
     println!("  Delete its files from the ignore directory, or remove it in `asadoc serve`.");
 }
 
-fn print_problems(problems: &[Problem]) {
+fn print_problems(problems: &[MarkerProblem]) {
     if problems.is_empty() {
         return;
     }

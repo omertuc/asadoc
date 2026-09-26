@@ -1,7 +1,7 @@
 //! The doc side: code blocks in the modules an `AsciiDoc` assembly includes.
 
-use crate::re::group;
-use crate::source::Docs;
+use crate::re::capture_group_text;
+use crate::source::DocsSource;
 use anyhow::{Context, Result};
 use regex::{Captures, Regex};
 use serde_yaml::{Mapping, Value};
@@ -10,12 +10,12 @@ use std::path::Path;
 
 /// A `[source,…]` block in a module
 #[derive(Clone, Debug)]
-pub(crate) struct Block {
+pub(crate) struct DocBlock {
     pub module: String,
-    pub lang: String,
+    pub language: String,
     /// 1-based position among the module's blocks of the same language
-    pub seq: usize,
-    /// `<module>/<lang>-<NNN>`: a name for the block's current position only
+    pub position_in_language: usize,
+    /// `<module>/<language>-<NNN>`: a name for the block's current position only
     pub reference: String,
     /// The lines between the `----` delimiters, ending with a newline
     pub content: String,
@@ -44,18 +44,18 @@ const BLOCK_TITLE: &str = r"^\.(\S)";
 const CONDITIONAL_DIRECTIVE: &str = r"^(ifdef|ifndef|endif)::";
 const WHITESPACE_RUN: &str = r"\s+";
 
-pub(crate) fn format_reference(module: &str, lang: &str, seq: usize) -> String {
-    format!("{module}/{lang}-{seq:03}")
+pub(crate) fn format_reference(module: &str, language: &str, position_in_language: usize) -> String {
+    format!("{module}/{language}-{position_in_language:03}")
 }
 
-pub(crate) fn read_assembly(docs: &Docs, path: &str) -> Result<Assembly> {
+pub(crate) fn read_assembly(docs: &DocsSource, path: &str) -> Result<Assembly> {
     let text = docs
         .read(path)
         .with_context(|| format!("reading the assembly {path}"))?
         .with_context(|| format!("assembly {path} not found in the docs"))?;
     let included = regex!(INCLUDE_MODULE)?
         .captures_iter(&text)
-        .map(|captures| group(&captures, 1))
+        .map(|captures| capture_group_text(&captures, 1))
         .collect::<Result<Vec<_>>>()
         .with_context(|| format!("finding the modules {path} includes"))?;
     let file_stem = Path::new(path)
@@ -63,7 +63,7 @@ pub(crate) fn read_assembly(docs: &Docs, path: &str) -> Result<Assembly> {
         .map(|stem| stem.to_string_lossy().into_owned())
         .unwrap_or_default();
     let title = match regex!(DOCUMENT_TITLE)?.captures(&text) {
-        Some(captures) => group(&captures, 1)?.trim().to_owned(),
+        Some(captures) => capture_group_text(&captures, 1)?.trim().to_owned(),
         None => file_stem.clone(),
     };
     Ok(Assembly {
@@ -119,15 +119,15 @@ fn lead_for(lines_above: &[&str]) -> Result<Option<String>> {
     Ok((!lead.is_empty()).then_some(lead))
 }
 
-/// The next 1-based position for a block in `lang`
-fn next_seq(seq_by_lang: &mut BTreeMap<String, usize>, lang: &str) -> usize {
-    let last_seq = seq_by_lang.entry(lang.to_owned()).or_insert(0);
-    *last_seq += 1;
-    *last_seq
+/// The next 1-based position for a block in `language`
+fn next_position_in_language(last_position_by_language: &mut BTreeMap<String, usize>, language: &str) -> usize {
+    let last_position = last_position_by_language.entry(language.to_owned()).or_insert(0);
+    *last_position += 1;
+    *last_position
 }
 
 /// A module's code blocks; none when the module doesn't exist
-pub(crate) fn extract_blocks(docs: &Docs, module: &str) -> Result<Vec<Block>> {
+pub(crate) fn extract_blocks(docs: &DocsSource, module: &str) -> Result<Vec<DocBlock>> {
     let Some(text) = docs
         .read(&module_path(module))
         .with_context(|| format!("reading the module {module}"))?
@@ -138,15 +138,15 @@ pub(crate) fn extract_blocks(docs: &Docs, module: &str) -> Result<Vec<Block>> {
     let lines: Vec<&str> = text.split('\n').collect();
     let is_delimiter = |line_index: &usize| lines.get(*line_index).is_some_and(|line| line.starts_with("----"));
     let mut blocks = Vec::new();
-    let mut seq_by_lang = BTreeMap::new();
+    let mut last_position_by_language = BTreeMap::new();
     let mut section = None;
     let mut line_index = 0;
     while let Some(line) = lines.get(line_index) {
         if let Some(heading_captures) = heading_line.captures(line) {
-            section = Some(group(&heading_captures, 1)?.trim().to_owned());
+            section = Some(capture_group_text(&heading_captures, 1)?.trim().to_owned());
         }
         if let Some(source_captures) = source_block_start.captures(line) {
-            let lang = group(&source_captures, 1)?.to_owned();
+            let language = capture_group_text(&source_captures, 1)?.to_owned();
             let lead = lead_for(lines.get(..line_index).unwrap_or_default())
                 .with_context(|| format!("finding the text introducing the block on line {}", line_index + 1))?;
             let Some(open_delimiter) = (line_index + 1..lines.len()).find(is_delimiter) else {
@@ -154,12 +154,12 @@ pub(crate) fn extract_blocks(docs: &Docs, module: &str) -> Result<Vec<Block>> {
             };
             let content_start = open_delimiter + 1;
             let close_delimiter = (content_start..lines.len()).find(is_delimiter).unwrap_or(lines.len());
-            let seq = next_seq(&mut seq_by_lang, &lang);
-            blocks.push(Block {
+            let position_in_language = next_position_in_language(&mut last_position_by_language, &language);
+            blocks.push(DocBlock {
                 module: module.to_owned(),
-                reference: format_reference(module, &lang, seq),
-                lang,
-                seq,
+                reference: format_reference(module, &language, position_in_language),
+                language,
+                position_in_language,
                 content: lines.get(content_start..close_delimiter).unwrap_or_default().join("\n") + "\n",
                 line: content_start + 1,
                 section: section.clone(),
@@ -193,7 +193,7 @@ const RESOLVE_PASSES: usize = 5;
 /// Attributes for rendering a module of `assembly` standalone: product title and
 /// version (from `_distro_map.yml`, like `AsciiBinder`), the attribute files the
 /// assembly includes, and the assembly's own header entries.
-pub(crate) fn assembly_attributes(docs: &Docs, assembly: &str) -> Result<BTreeMap<String, String>> {
+pub(crate) fn assembly_attributes(docs: &DocsSource, assembly: &str) -> Result<BTreeMap<String, String>> {
     docs.prefetch(&[
         "_distro_map.yml".to_owned(),
         "_attributes".to_owned(),
@@ -217,7 +217,7 @@ pub(crate) fn assembly_attributes(docs: &Docs, assembly: &str) -> Result<BTreeMa
 }
 
 /// Product title and version, from `_distro_map.yml`
-fn distro_attributes(docs: &Docs) -> Result<Vec<(String, String)>> {
+fn distro_attributes(docs: &DocsSource) -> Result<Vec<(String, String)>> {
     let Some(distro_map_text) = docs.read("_distro_map.yml").context("reading _distro_map.yml")? else {
         return Ok(vec![]);
     };
@@ -247,10 +247,10 @@ fn latest_enterprise_version(branches: &Mapping) -> Result<Option<(u32, u32)>> {
         .filter_map(|branch| enterprise_branch.captures(branch))
         .map(|captures| -> Result<(u32, u32)> {
             Ok((
-                group(&captures, 1)?
+                capture_group_text(&captures, 1)?
                     .parse()
                     .context("parsing a branch's major version")?,
-                group(&captures, 2)?
+                capture_group_text(&captures, 2)?
                     .parse()
                     .context("parsing a branch's minor version")?,
             ))
@@ -262,7 +262,7 @@ fn latest_enterprise_version(branches: &Mapping) -> Result<Option<(u32, u32)>> {
 /// The attribute entries above the assembly's first module, and those in the
 /// attribute files it includes there
 fn add_header_attributes(
-    docs: &Docs,
+    docs: &DocsSource,
     assembly: &str,
     text: &str,
     attributes: &mut BTreeMap<String, String>,
@@ -296,10 +296,10 @@ fn add_attribute_entries(text: &str, attributes: &mut BTreeMap<String, String>) 
     let mut enclosing_conditions: Vec<bool> = Vec::new();
     for line in text.lines() {
         if let Some(captures) = conditional_block.captures(line) {
-            let any_defined = group(&captures, 2)?
+            let any_defined = capture_group_text(&captures, 2)?
                 .split([',', '+'])
                 .any(|name| attributes.contains_key(name));
-            match group(&captures, 1)? {
+            match capture_group_text(&captures, 1)? {
                 "ifdef" => enclosing_conditions.push(any_defined),
                 "ifndef" => enclosing_conditions.push(!any_defined),
                 _ => {
@@ -311,7 +311,10 @@ fn add_attribute_entries(text: &str, attributes: &mut BTreeMap<String, String>) 
         if enclosing_conditions.iter().all(|is_active| *is_active)
             && let Some(captures) = attribute_entry.captures(line)
         {
-            attributes.insert(group(&captures, 1)?.to_owned(), group(&captures, 2)?.to_owned());
+            attributes.insert(
+                capture_group_text(&captures, 1)?.to_owned(),
+                capture_group_text(&captures, 2)?.to_owned(),
+            );
         }
     }
     Ok(())
@@ -351,7 +354,7 @@ fn resolve_once(attribute_reference: &Regex, attributes: &BTreeMap<String, Strin
 }
 
 /// A module's text for rendering: its `//` comment lines removed; None when there's no such module
-pub(crate) fn module_for_rendering(docs: &Docs, module: &str) -> Result<Option<String>> {
+pub(crate) fn module_for_rendering(docs: &DocsSource, module: &str) -> Result<Option<String>> {
     let text = docs
         .read(&module_path(module))
         .with_context(|| format!("reading the module {module}"))?;

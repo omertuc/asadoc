@@ -9,7 +9,7 @@ use std::collections::BTreeMap;
 use std::fmt::Write;
 
 /// The value each placeholder took
-pub(crate) type Values = BTreeMap<String, String>;
+pub(crate) type PlaceholderValues = BTreeMap<String, String>;
 
 struct PlaceholderPattern {
     regex: Regex,
@@ -65,7 +65,7 @@ impl PlaceholderPattern {
         })
     }
 
-    fn captures(&self, doc: &str) -> Result<Option<Values>> {
+    fn captures(&self, doc: &str) -> Result<Option<PlaceholderValues>> {
         let Some(captures) = self.regex.captures(doc).context("matching the code's pattern")? else {
             return Ok(None);
         };
@@ -87,7 +87,7 @@ impl PlaceholderPattern {
 
     /// The first of `doc_lines` from `start` on that this matches: its index
     /// and the values it gives
-    fn first_match(&self, doc_lines: &[&str], start: usize) -> Result<Option<(usize, Values)>> {
+    fn first_match(&self, doc_lines: &[&str], start: usize) -> Result<Option<(usize, PlaceholderValues)>> {
         doc_lines
             .iter()
             .enumerate()
@@ -149,9 +149,9 @@ impl Matcher {
     }
 
     /// Whether the code matches `doc`, and if so the value each placeholder took
-    pub(crate) fn matches(&self, doc: &str) -> Result<Option<Values>> {
+    pub(crate) fn matches(&self, doc: &str) -> Result<Option<PlaceholderValues>> {
         match &self.whole_pattern {
-            None => Ok((self.content == doc).then(Values::new)),
+            None => Ok((self.content == doc).then(PlaceholderValues::new)),
             Some(whole_pattern) => whole_pattern.captures(doc),
         }
     }
@@ -210,12 +210,12 @@ fn fill_line(
 }
 
 /// One-off matching (for content that isn't compiled ahead of time)
-pub(crate) fn match_content(content: &str, placeholders: &[String], doc: &str) -> Result<Option<Values>> {
+pub(crate) fn match_content(content: &str, placeholders: &[String], doc: &str) -> Result<Option<PlaceholderValues>> {
     if !placeholders
         .iter()
         .any(|placeholder| content.contains(placeholder.as_str()))
     {
-        return Ok((content == doc).then(Values::new));
+        return Ok((content == doc).then(PlaceholderValues::new));
     }
     Matcher::new(content, placeholders)
         .context("compiling the content for matching")?
@@ -234,7 +234,7 @@ mod tests {
         assert_eq!(values["<A>"], "1");
         assert!(match_content("x: <A>\ny: <A>\n", &placeholders, "x: 1\ny: 2\n")?.is_none());
         assert!(match_content("x: <A>\n", &placeholders, "x: 1\n2\n")?.is_none());
-        assert_eq!(match_content("same\n", &[], "same\n")?, Some(Values::new()));
+        assert_eq!(match_content("same\n", &[], "same\n")?, Some(PlaceholderValues::new()));
         Ok(())
     }
 

@@ -16,7 +16,7 @@ macro_rules! regex {
 }
 
 /// The text of capture group `group_index`
-pub(crate) fn group<'t>(captures: &Captures<'t>, group_index: usize) -> Result<&'t str> {
+pub(crate) fn capture_group_text<'t>(captures: &Captures<'t>, group_index: usize) -> Result<&'t str> {
     captures
         .get(group_index)
         .map(|matched| matched.as_str())

@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Mutex, MutexGuard};
 
-pub(crate) enum Docs {
+pub(crate) enum DocsSource {
     Local(PathBuf),
     Git(GitDocs),
 }
@@ -27,7 +27,7 @@ pub(crate) struct GitDocs {
     file_cache: Mutex<HashMap<String, Option<String>>>,
 }
 
-impl Docs {
+impl DocsSource {
     /// A file's text, by path relative to the docs root; None when there's no such file
     pub(crate) fn read(&self, path: &str) -> Result<Option<String>> {
         match self {

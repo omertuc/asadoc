@@ -26,7 +26,7 @@
 //! (letters, digits and `_`): `param: "<*>"` makes every `<NAME>` in the code a
 //! placeholder, without the marker spelling any of them out.
 
-use crate::re::group;
+use crate::re::capture_group_text;
 use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
 use serde::Serialize;
@@ -38,16 +38,16 @@ pub(crate) const MARKER_PREFIX: &str = "@docs-as-code:";
 pub(crate) fn file_marker() -> String {
     format!("{MARKER_PREFIX} file")
 }
-pub(crate) fn section_start(name: &str) -> String {
+pub(crate) fn section_start_marker(name: &str) -> String {
     format!("{MARKER_PREFIX} start section \"{name}\"")
 }
-pub(crate) fn section_end(name: &str) -> String {
+pub(crate) fn section_end_marker(name: &str) -> String {
     format!("{MARKER_PREFIX} end section \"{name}\"")
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
-pub(crate) enum Side {
+pub(crate) enum OptionSide {
     Repo,
     Doc,
 }
@@ -63,7 +63,7 @@ pub(crate) enum OptionValue {
 pub(crate) struct MarkerOption {
     pub key: String,
     pub value: Option<OptionValue>,
-    pub side: Side,
+    pub side: OptionSide,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -85,7 +85,7 @@ fn option_kind(key: &str) -> Option<OptionKind> {
 }
 
 impl MarkerOption {
-    pub(crate) fn text(key: &str, value: &str, side: Side) -> Self {
+    pub(crate) fn text(key: &str, value: &str, side: OptionSide) -> Self {
         Self {
             key: key.to_owned(),
             value: Some(OptionValue::Text(value.to_owned())),
@@ -99,8 +99,8 @@ impl MarkerOption {
         }
     }
     /// As written on a marker
-    pub(crate) fn format(&self) -> String {
-        let side = if self.side == Side::Doc { "doc " } else { "" };
+    pub(crate) fn marker_text(&self) -> String {
+        let side = if self.side == OptionSide::Doc { "doc " } else { "" };
         let value = match &self.value {
             None => String::new(),
             Some(OptionValue::Reindent { from, to }) => format!(": {from} -> {to}"),
@@ -227,7 +227,7 @@ fn parse_option(cursor: &mut OptionCursor) -> Result<MarkerOption> {
         bail!("expected an option name at \"{}\"", cursor.remaining());
     }
     let kind = option_kind(&key).with_context(|| format!("unknown option \"{key}\""))?;
-    if side == Side::Doc && key == "param" {
+    if side == OptionSide::Doc && key == "param" {
         bail!("\"param\" only applies to the repo side");
     }
     cursor.skip_whitespace();
@@ -251,17 +251,17 @@ fn parse_option(cursor: &mut OptionCursor) -> Result<MarkerOption> {
 }
 
 /// `doc ` before an option's name makes it apply to the doc side
-fn parse_side(cursor: &mut OptionCursor) -> Side {
+fn parse_side(cursor: &mut OptionCursor) -> OptionSide {
     let on_doc = cursor
         .remaining()
         .strip_prefix("doc")
         .is_some_and(|after_doc| after_doc.starts_with(char::is_whitespace));
     if !on_doc {
-        return Side::Repo;
+        return OptionSide::Repo;
     }
     cursor.eat_str("doc");
     cursor.skip_whitespace();
-    Side::Doc
+    OptionSide::Doc
 }
 
 /// The `:` between an option's name and its value
@@ -300,30 +300,30 @@ fn parse_reindent(cursor: &mut OptionCursor, key: &str) -> Result<OptionValue> {
 
 /// A file marker or a section's start marker, with its continuation lines
 #[derive(Clone, Debug)]
-pub(crate) struct Header {
+pub(crate) struct MarkerHeader {
     /// Byte range of the marker lines (continuations included)
     pub marker_from: usize,
     pub marker_to: usize,
     /// 1-based line numbers of the first and last marker line
-    pub start_line: usize,
+    pub first_line: usize,
     pub last_line: usize,
     pub options: Vec<MarkerOption>,
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct Section {
+pub(crate) struct MarkedSection {
     pub name: String,
-    pub header: Header,
+    pub header: MarkerHeader,
     /// Byte range of the marked lines
-    pub from: usize,
-    pub to: usize,
+    pub content_from: usize,
+    pub content_to: usize,
     pub end_line: usize,
 }
 
 #[derive(Default, Debug)]
 pub(crate) struct Markers {
-    pub file: Option<Header>,
-    pub sections: BTreeMap<String, Section>,
+    pub file: Option<MarkerHeader>,
+    pub sections: BTreeMap<String, MarkedSection>,
     pub problems: Vec<String>,
 }
 
@@ -340,7 +340,7 @@ struct MarkerPatterns {
 }
 
 /// Sections whose start marker was seen but not yet their end
-type OpenSections = BTreeMap<String, Header>;
+type OpenSections = BTreeMap<String, MarkerHeader>;
 
 /// Where a marker's lines (continuations included) are in the text
 struct MarkerSpan {
@@ -355,11 +355,11 @@ struct MarkerSpan {
 }
 
 impl MarkerSpan {
-    const fn header(&self, options: Vec<MarkerOption>) -> Header {
-        Header {
+    const fn header(&self, options: Vec<MarkerOption>) -> MarkerHeader {
+        MarkerHeader {
             marker_from: self.marker_from,
             marker_to: self.marker_to,
-            start_line: self.first_line,
+            first_line: self.first_line,
             last_line: self.last_line,
             options,
         }
@@ -408,14 +408,14 @@ pub(crate) fn parse_markers(text: &str) -> Result<Markers> {
     markers.problems.extend(
         open_sections
             .into_iter()
-            .map(|(name, header)| format!("line {}: section \"{name}\" has no end marker", header.start_line)),
+            .map(|(name, header)| format!("line {}: section \"{name}\" has no end marker", header.first_line)),
     );
     if let Some(header) = &markers.file
         && !markers.sections.is_empty()
     {
         markers.problems.push(format!(
             "line {}: a file marked whole can't also have sections (its marked content would include their markers)",
-            header.start_line
+            header.first_line
         ));
     }
     Ok(markers)
@@ -450,7 +450,7 @@ fn marker_body(
         .skip(first_line_index + 1)
         .take_while(|line| !line.contains(MARKER_PREFIX))
         .map_while(|line| continuation_pattern.captures(line))
-        .map(|captures| group(&captures, 1))
+        .map(|captures| capture_group_text(&captures, 1))
         .collect::<Result<Vec<_>>>()?;
     let last_line_index = first_line_index + continuation_texts.len();
     Ok((
@@ -472,26 +472,26 @@ fn record_marker(
     open_sections: &mut OpenSections,
 ) -> Result<()> {
     if let Some(captures) = patterns.file.captures(marker_text) {
-        markers.file = Some(span.header(parse_options(group(&captures, 1)?)?));
+        markers.file = Some(span.header(parse_options(capture_group_text(&captures, 1)?)?));
     } else if let Some(captures) = patterns.start.captures(marker_text) {
-        let name = group(&captures, 1)?.to_owned();
-        let header = span.header(parse_options(group(&captures, 2)?)?);
+        let name = capture_group_text(&captures, 1)?.to_owned();
+        let header = span.header(parse_options(capture_group_text(&captures, 2)?)?);
         if open_sections.contains_key(&name) || markers.sections.contains_key(&name) {
             bail!("section \"{name}\" is defined twice");
         }
         open_sections.insert(name, header);
     } else if let Some(captures) = patterns.end.captures(marker_text) {
-        let name = group(&captures, 1)?.to_owned();
+        let name = capture_group_text(&captures, 1)?.to_owned();
         let header = open_sections
             .remove(&name)
             .with_context(|| format!("end of section \"{name}\" without a start"))?;
         markers.sections.insert(
             name.clone(),
-            Section {
+            MarkedSection {
                 name,
-                from: header.marker_to,
+                content_from: header.marker_to,
                 header,
-                to: span.last_line_start,
+                content_to: span.last_line_start,
                 end_line: span.last_line,
             },
         );
@@ -696,7 +696,7 @@ fn param_names(param: &str, content: &str) -> Result<Vec<String>> {
 pub(crate) fn continuation_lines(indent: &str, options: &[MarkerOption]) -> String {
     options
         .iter()
-        .map(|option| format!("{indent}#   | {}\n", option.format()))
+        .map(|option| format!("{indent}#   | {}\n", option.marker_text()))
         .collect::<Vec<_>>()
         .concat()
 }
@@ -713,19 +713,21 @@ mod tests {
         assert!(markers.problems.is_empty(), "{:?}", markers.problems);
         let section = &markers.sections["s"];
         assert_eq!(
-            (section.header.start_line, section.header.last_line, section.end_line),
+            (section.header.first_line, section.header.last_line, section.end_line),
             (2, 5, 8)
         );
         assert_eq!(section.header.options.len(), 5);
-        assert_eq!(section.header.options[0].side, Side::Doc);
+        assert_eq!(section.header.options[0].side, OptionSide::Doc);
         let repo_options: Vec<_> = section
             .header
             .options
             .iter()
-            .filter(|option| option.side == Side::Repo)
+            .filter(|option| option.side == OptionSide::Repo)
             .cloned()
             .collect();
-        let raw_section = text.get(section.from..section.to).context("section outside the text")?;
+        let raw_section = text
+            .get(section.content_from..section.content_to)
+            .context("section outside the text")?;
         assert_eq!(apply_options(raw_section, &repo_options)?, "a \\\n  b <A>\n");
         Ok(())
     }

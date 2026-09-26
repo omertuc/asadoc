@@ -27,12 +27,12 @@ pub(crate) struct IgnoredEntry {
     pub content: String,
 }
 
-pub(crate) struct Ignored {
+pub(crate) struct IgnoredBlocks {
     ignore_dir: PathBuf,
     pub entries: Vec<IgnoredEntry>,
 }
 
-impl Ignored {
+impl IgnoredBlocks {
     pub(crate) fn load(ignore_dir: &Path) -> Result<Self> {
         let entries = IGNORE_REASONS
             .iter()
@@ -148,12 +148,12 @@ mod tests {
         if ignore_dir.exists() {
             fs::remove_dir_all(&ignore_dir).context("clearing the test directory")?;
         }
-        let mut ignored_blocks = Ignored::load(&ignore_dir)?;
+        let mut ignored_blocks = IgnoredBlocks::load(&ignore_dir)?;
         ignored_blocks.ignore("$ oc get nodes\n", "manual-command", "mod/terminal-001", None)?;
         ignored_blocks.ignore("  indented\n\nno trailing", "example-output", "mod/terminal-002", None)?;
         // Same content again moves it; a name taken by other content gets a suffix
         ignored_blocks.ignore("$ oc get nodes\n", "example-output", "mod/terminal-002", None)?;
-        let mut reloaded_blocks = Ignored::load(&ignore_dir)?;
+        let mut reloaded_blocks = IgnoredBlocks::load(&ignore_dir)?;
         assert_eq!(reloaded_blocks.reason_of("$ oc get nodes\n"), Some("example-output"));
         assert_eq!(
             reloaded_blocks.reason_of("  indented\n\nno trailing"),
@@ -161,7 +161,7 @@ mod tests {
         );
         assert!(ignore_dir.join("example-output/mod--terminal-002-2.txt").exists());
         reloaded_blocks.unignore("$ oc get nodes\n")?;
-        assert_eq!(Ignored::load(&ignore_dir)?.entries.len(), 1);
+        assert_eq!(IgnoredBlocks::load(&ignore_dir)?.entries.len(), 1);
         fs::remove_dir_all(ignore_dir).context("cleaning up the test directory")?;
         Ok(())
     }

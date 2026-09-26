@@ -8,8 +8,8 @@ use similar::{ChangeTag, TextDiff};
 use crate::config::AsadocConfig;
 use crate::eval::{self, AssemblyEval, BlockEval, CandidateInfo, CodeMatch, Evaluation};
 use crate::lightbulb;
-use crate::matching::Values;
-use crate::repo::{MarkedCode, Problem};
+use crate::matching::PlaceholderValues;
+use crate::repo::{MarkedCode, MarkerProblem};
 use anyhow::{Context, Result, bail};
 
 /// How far some code is from a doc block, in lines
@@ -107,7 +107,7 @@ pub(crate) struct CheckSummary {
     pub unused_code: Vec<UnusedCode>,
     /// (reason, first line) of ignored content no block has anymore
     pub stale_ignored: Vec<(String, String)>,
-    pub problems: Vec<Problem>,
+    pub problems: Vec<MarkerProblem>,
 }
 
 impl CheckSummary {
@@ -147,10 +147,10 @@ fn closest_from_candidate(candidate: &CandidateInfo) -> Closest {
     match candidate.kind {
         "unmarked-file" => Closest::UnmarkedFile {
             file: candidate.file.clone(),
-            line_diff: LineDiff::new(&candidate.doc, &candidate.content),
+            line_diff: LineDiff::new(&candidate.block_side, &candidate.content),
         },
         "lines" => {
-            let (first_line, last_line) = candidate.lines.unwrap_or_default();
+            let (first_line, last_line) = candidate.line_range.unwrap_or_default();
             Closest::Lines {
                 file: candidate.file.clone(),
                 first_line,
@@ -158,8 +158,8 @@ fn closest_from_candidate(candidate: &CandidateInfo) -> Closest {
             }
         }
         _ => Closest::Marked {
-            name: code_name(&candidate.file, candidate.name.as_deref()),
-            line_diff: LineDiff::new(&candidate.doc, &candidate.content),
+            name: code_name(&candidate.file, candidate.section_name.as_deref()),
+            line_diff: LineDiff::new(&candidate.block_side, &candidate.content),
         },
     }
 }
@@ -168,7 +168,7 @@ fn fix_steps(candidate: &CandidateInfo) -> Option<Vec<String>> {
     candidate
         .plan
         .as_ref()
-        .map(|plan| lightbulb::describe(plan, &candidate.file, candidate.name.as_deref()))
+        .map(|plan| lightbulb::describe(plan, &candidate.file, candidate.section_name.as_deref()))
 }
 
 fn doc_label(block_eval: &BlockEval, doc_options_applied: bool) -> String {
@@ -203,7 +203,7 @@ impl CheckSummary {
             .collect();
         let shown_code_ids = shown_code_ids(evaluation);
         let unused_code = evaluation
-            .unused
+            .unused_marked_indexes
             .iter()
             .map(|&marked_index| describe_unused_code(evaluation, &shown_code_ids, marked_index))
             .filter_map(Result::transpose)
@@ -310,7 +310,7 @@ pub(crate) enum CheckOutcome {
     Resolved {
         reference: String,
         matched_codes: Vec<String>,
-        placeholder_values: Values,
+        placeholder_values: PlaceholderValues,
     },
     /// No code matches the block; this is the closest
     Unmatched {
@@ -374,7 +374,7 @@ fn find_marked_code<'a>(evaluation: &'a Evaluation, code_arg: &str) -> Vec<&'a M
 /// Whether a block's match is with the given marked code
 fn is_match_with(evaluation: &Evaluation, code_match: &CodeMatch, marked_code: &MarkedCode) -> bool {
     evaluation
-        .marked(code_match.code)
+        .marked(code_match.marked_index)
         .is_ok_and(|matched_code| matched_code.id == marked_code.id)
 }
 
@@ -455,7 +455,7 @@ fn block_outcome_against(
             placeholder_values: code_match.values.clone(),
         });
     }
-    let Some((doc_text, filled_code)) = eval::compare(against_code, &block_eval.block)
+    let Some((doc_text, filled_code)) = eval::diff_sides(against_code, &block_eval.block)
         .with_context(|| format!("comparing {} with {reference}", describe_code(against_code)))?
     else {
         return Ok(CheckOutcome::DocOptionsDontFit {
@@ -488,7 +488,7 @@ fn block_outcome(evaluation: &Evaluation, block_eval: &BlockEval) -> Result<Chec
         let matched_codes = block_eval
             .matches
             .iter()
-            .map(|code_match| evaluation.marked(code_match.code).map(describe_code))
+            .map(|code_match| evaluation.marked(code_match.marked_index).map(describe_code))
             .collect::<Result<Vec<_>>>()
             .with_context(|| format!("describing the code {reference} matches"))?;
         return Ok(CheckOutcome::Resolved {
@@ -510,11 +510,11 @@ fn block_outcome(evaluation: &Evaluation, block_eval: &BlockEval) -> Result<Chec
         closest: closest_from_candidate(top_candidate),
         fix_steps: fix_steps(top_candidate),
         sides: Sides {
-            doc_text: top_candidate.doc.clone(),
+            doc_text: top_candidate.block_side.clone(),
             doc_label: doc_label(block_eval, !top_candidate.doc_options.is_empty()),
             code_text: top_candidate.content.clone(),
             code_label: code_label(
-                &code_name(&top_candidate.file, top_candidate.name.as_deref()),
+                &code_name(&top_candidate.file, top_candidate.section_name.as_deref()),
                 !top_candidate.options.is_empty(),
             ),
         },
@@ -583,12 +583,17 @@ pub(crate) fn fix(config: &AsadocConfig, reference: &str) -> Result<FixOutcome> 
     else {
         return Ok(FixOutcome::NoFix);
     };
-    lightbulb::apply(&config.repo_root, &candidate.file, candidate.name.as_deref(), plan)
-        .with_context(|| format!("changing {}", candidate.file))?;
+    lightbulb::apply(
+        &config.repo_root,
+        &candidate.file,
+        candidate.section_name.as_deref(),
+        plan,
+    )
+    .with_context(|| format!("changing {}", candidate.file))?;
     let reevaluation = eval::evaluate(config, false).context("checking the block again")?;
     Ok(FixOutcome::Applied {
         changed_file: candidate.file.clone(),
-        steps: lightbulb::describe(plan, &candidate.file, candidate.name.as_deref()),
+        steps: lightbulb::describe(plan, &candidate.file, candidate.section_name.as_deref()),
         resolved: reevaluation
             .blocks()
             .any(|(_, block_eval)| block_eval.block.reference == reference && block_eval.resolved()),

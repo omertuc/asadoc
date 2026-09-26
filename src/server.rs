@@ -2,14 +2,14 @@
 //! only presents; everything it shows is computed here, and every change it
 //! asks for is made here.
 
-use crate::config::{AsadocConfig, Links};
+use crate::config::{AsadocConfig, SourceLinkBases};
 use crate::docs;
-use crate::eval::{self, AssemblyEval, BlockEval, CandidateInfo, Evaluation, Formerly};
-use crate::ignored::{self, Ignored};
+use crate::eval::{self, AssemblyEval, BlockEval, CandidateInfo, Evaluation, FormerIgnoredEntry};
+use crate::ignored::{self, IgnoredBlocks};
 use crate::lightbulb;
 use crate::markers::MarkerOption;
-use crate::matching::Values;
-use crate::repo::{self, MarkedCode, Problem};
+use crate::matching::PlaceholderValues;
+use crate::repo::{self, MarkedCode, MarkerProblem};
 use anyhow::{Context, Result, anyhow};
 use axum::Router;
 use axum::extract::{Query, State};
@@ -156,19 +156,20 @@ struct CodeRef {
     id: String,
     file: String,
     snippet: Option<String>,
-    lines: Option<(usize, usize)>,
+    #[serde(rename = "lines")]
+    line_range: Option<(usize, usize)>,
     marker_lines: Vec<usize>,
     options: Vec<MarkerOption>,
     doc_options: Vec<MarkerOption>,
-    values: Option<Values>,
+    values: Option<PlaceholderValues>,
 }
 
-fn code_ref(marked_code: &MarkedCode, values: Option<&Values>) -> CodeRef {
+fn code_ref(marked_code: &MarkedCode, values: Option<&PlaceholderValues>) -> CodeRef {
     CodeRef {
         id: marked_code.id.clone(),
         file: marked_code.file.clone(),
         snippet: marked_code.section.clone(),
-        lines: marked_code.lines,
+        line_range: marked_code.line_range,
         marker_lines: marked_code.marker_lines.clone(),
         options: marked_code.options.clone(),
         doc_options: marked_code.doc_options.clone(),
@@ -184,8 +185,10 @@ struct BlockData {
     #[serde(rename = "ref")]
     reference: String,
     module: String,
-    lang: String,
-    seq: usize,
+    #[serde(rename = "lang")]
+    language: String,
+    #[serde(rename = "seq")]
+    position_in_language: usize,
     line: usize,
     content: String,
     section: Option<String>,
@@ -193,7 +196,8 @@ struct BlockData {
     #[serde(skip_serializing_if = "Option::is_none")]
     candidates: Option<Vec<CandidateInfo>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    formerly: Option<Vec<Formerly>>,
+    #[serde(rename = "formerly")]
+    former_ignored_entries: Option<Vec<FormerIgnoredEntry>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     #[serde(rename = "code")]
     matched_code: Option<Vec<CodeRef>>,
@@ -218,7 +222,7 @@ struct BlockLink {
     #[serde(rename = "ref")]
     reference: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    values: Option<Values>,
+    values: Option<PlaceholderValues>,
     #[serde(skip_serializing_if = "Option::is_none")]
     similarity: Option<f64>,
 }
@@ -247,10 +251,10 @@ struct ReportData {
     stale_ignored: Vec<StaleIgnored>,
     #[serde(rename = "code")]
     marked_code: Vec<CodeData>,
-    problems: Vec<Problem>,
+    problems: Vec<MarkerProblem>,
     /// Where the docs are, for people
     docs_location: String,
-    links: Links,
+    links: SourceLinkBases,
 }
 
 /// Each marked code, with the blocks that match or resemble it
@@ -273,7 +277,10 @@ fn matched_by(evaluation: &Evaluation, code_index: usize) -> Vec<BlockLink> {
     evaluation
         .blocks()
         .filter_map(|(assembly, block)| {
-            let code_match = block.matches.iter().find(|code_match| code_match.code == code_index)?;
+            let code_match = block
+                .matches
+                .iter()
+                .find(|code_match| code_match.marked_index == code_index)?;
             Some(BlockLink {
                 assembly_id: assembly.assembly.id.clone(),
                 reference: block.block.reference.clone(),
@@ -340,7 +347,7 @@ fn guide_data(evaluation: &Evaluation, assembly: &AssemblyEval) -> Result<GuideD
             .filter(|block| !block.done())
             .map(|block| BlockData {
                 candidates: Some(block.candidates.clone()),
-                formerly: Some(block.formerly.clone()),
+                former_ignored_entries: Some(block.former_ignored_entries.clone()),
                 ..block_data(assembly, block)
             })
             .collect(),
@@ -352,7 +359,12 @@ fn guide_data(evaluation: &Evaluation, assembly: &AssemblyEval) -> Result<GuideD
                 let matched_code = block
                     .matches
                     .iter()
-                    .map(|code_match| Ok(code_ref(evaluation.marked(code_match.code)?, Some(&code_match.values))))
+                    .map(|code_match| {
+                        Ok(code_ref(
+                            evaluation.marked(code_match.marked_index)?,
+                            Some(&code_match.values),
+                        ))
+                    })
                     .collect::<Result<_>>()
                     .with_context(|| format!("listing the code {} matches", block.block.reference))?;
                 Ok(BlockData {
@@ -379,14 +391,14 @@ fn block_data(assembly: &AssemblyEval, block: &BlockEval) -> BlockData {
         assembly_id: assembly.assembly.id.clone(),
         reference: block.block.reference.clone(),
         module: block.block.module.clone(),
-        lang: block.block.lang.clone(),
-        seq: block.block.seq,
+        language: block.block.language.clone(),
+        position_in_language: block.block.position_in_language,
         line: block.block.line,
         content: block.block.content.clone(),
         section: block.block.section.clone(),
         lead: block.block.lead.clone(),
         candidates: None,
-        formerly: None,
+        former_ignored_entries: None,
         matched_code: None,
         ignored_as: None,
     }
@@ -508,7 +520,7 @@ async fn serve_file(State(state): State<SharedState>, Query(file_query): Query<F
     if !is_plain_relative {
         return Err(anyhow!("bad path {:?}", file_query.path)).status(StatusCode::BAD_REQUEST);
     }
-    let file_text = repo::read(&state.config.repo_root, &file_query.path)
+    let file_text = repo::read_repo_file(&state.config.repo_root, &file_query.path)
         .with_context(|| format!("reading {}", file_query.path))?
         .with_context(|| format!("no text file {}", file_query.path))
         .status(StatusCode::NOT_FOUND)?;
@@ -558,8 +570,13 @@ async fn apply_fix(State(state): State<SharedState>, Json(action): Json<BlockAct
             .and_then(|candidate| candidate.plan.as_ref().map(|fix_plan| (candidate, fix_plan)))
             .with_context(|| format!("{candidate_id} has no fix for {} anymore", action.reference))
             .status(StatusCode::CONFLICT)?;
-        lightbulb::apply(&config.repo_root, &candidate.file, candidate.name.as_deref(), fix_plan)
-            .with_context(|| format!("applying the fix to {candidate_id}"))?;
+        lightbulb::apply(
+            &config.repo_root,
+            &candidate.file,
+            candidate.section_name.as_deref(),
+            fix_plan,
+        )
+        .with_context(|| format!("applying the fix to {candidate_id}"))?;
         println!("Fixed {candidate_id} for {}", action.reference);
         Ok(success_response())
     })
@@ -567,8 +584,8 @@ async fn apply_fix(State(state): State<SharedState>, Json(action): Json<BlockAct
 }
 
 /// Loads the ignore directory and makes a change to it
-fn update_ignored(config: &AsadocConfig, change: impl FnOnce(&mut Ignored) -> Result<()>) -> Result<()> {
-    let mut ignored_blocks = Ignored::load(&config.ignore_dir).context("loading the ignore directory")?;
+fn update_ignored(config: &AsadocConfig, change: impl FnOnce(&mut IgnoredBlocks) -> Result<()>) -> Result<()> {
+    let mut ignored_blocks = IgnoredBlocks::load(&config.ignore_dir).context("loading the ignore directory")?;
     change(&mut ignored_blocks)
 }
 
