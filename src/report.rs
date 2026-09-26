@@ -15,27 +15,27 @@ use anyhow::{Context, Result, bail};
 /// How far some code is from a doc block, in lines
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct LineDiff {
-    pub doc_lines: usize,
+    pub doc_line_count: usize,
     /// Doc lines the code doesn't have
-    pub differ: usize,
+    pub differing_lines: usize,
     /// Code lines the doc doesn't have
-    pub extra: usize,
+    pub extra_code_lines: usize,
 }
 
 impl LineDiff {
-    pub(crate) fn new(doc: &str, code: &str) -> Self {
-        let (differ, extra) =
-            TextDiff::from_lines(doc, code)
-                .iter_all_changes()
-                .fold((0, 0), |(differ, extra), change| match change.tag() {
-                    ChangeTag::Delete => (differ + 1, extra),
-                    ChangeTag::Insert => (differ, extra + 1),
-                    ChangeTag::Equal => (differ, extra),
-                });
+    pub(crate) fn new(doc_text: &str, code_text: &str) -> Self {
+        let (differing_lines, extra_code_lines) = TextDiff::from_lines(doc_text, code_text).iter_all_changes().fold(
+            (0, 0),
+            |(differing_lines, extra_code_lines), change| match change.tag() {
+                ChangeTag::Delete => (differing_lines + 1, extra_code_lines),
+                ChangeTag::Insert => (differing_lines, extra_code_lines + 1),
+                ChangeTag::Equal => (differing_lines, extra_code_lines),
+            },
+        );
         Self {
-            doc_lines: doc.lines().count(),
-            differ,
-            extra,
+            doc_line_count: doc_text.lines().count(),
+            differing_lines,
+            extra_code_lines,
         }
     }
 }
@@ -43,9 +43,9 @@ impl LineDiff {
 /// A doc side and a code side, to show as a diff
 #[derive(Debug)]
 pub(crate) struct Sides {
-    pub doc: String,
+    pub doc_text: String,
     pub doc_label: String,
-    pub code: String,
+    pub code_text: String,
     pub code_label: String,
 }
 
@@ -54,17 +54,17 @@ pub(crate) struct Sides {
 pub(crate) enum Closest {
     Marked {
         name: String,
-        diff: LineDiff,
+        line_diff: LineDiff,
     },
     UnmarkedFile {
         file: String,
-        diff: LineDiff,
+        line_diff: LineDiff,
     },
     /// Lines of a file that, marked as a section, would match
     Lines {
         file: String,
-        from: usize,
-        to: usize,
+        first_line: usize,
+        last_line: usize,
     },
 }
 
@@ -75,7 +75,7 @@ pub(crate) struct UnresolvedBlock {
     pub location: String,
     pub closest: Option<Closest>,
     /// The changes `asadoc fix` would make
-    pub fix: Option<Vec<String>>,
+    pub fix_steps: Option<Vec<String>>,
 }
 
 /// The blocks still to resolve in one assembly
@@ -88,41 +88,42 @@ pub(crate) struct UnresolvedInAssembly {
 
 /// Marked code no doc block matches
 #[derive(Debug)]
-pub(crate) struct Unused {
+pub(crate) struct UnusedCode {
     pub name: String,
     /// The block most like it
-    pub closest: Option<(String, LineDiff)>,
+    pub closest_block: Option<(String, LineDiff)>,
 }
 
 /// Everything `asadoc check` reports
 #[derive(Debug)]
-pub(crate) struct Summary {
-    pub docs: String,
-    pub total: usize,
-    pub resolved: usize,
-    pub ignored: usize,
+pub(crate) struct CheckSummary {
+    pub docs_description: String,
+    pub total_blocks: usize,
+    pub resolved_blocks: usize,
+    pub ignored_blocks: usize,
     /// Blocks to resolve, by assembly
     pub unresolved: Vec<UnresolvedInAssembly>,
     /// Marked code no block matches that isn't any block's closest code
-    pub unused: Vec<Unused>,
+    pub unused_code: Vec<UnusedCode>,
     /// (reason, first line) of ignored content no block has anymore
     pub stale_ignored: Vec<(String, String)>,
     pub problems: Vec<Problem>,
 }
 
-impl Summary {
-    pub(crate) const fn open(&self) -> usize {
-        self.total.saturating_sub(self.resolved + self.ignored)
+impl CheckSummary {
+    pub(crate) const fn blocks_to_resolve(&self) -> usize {
+        self.total_blocks
+            .saturating_sub(self.resolved_blocks + self.ignored_blocks)
     }
-    pub(crate) fn fixable(&self) -> usize {
+    pub(crate) fn fixable_blocks(&self) -> usize {
         self.unresolved
             .iter()
             .flat_map(|assembly| &assembly.blocks)
-            .filter(|block| block.fix.is_some())
+            .filter(|block| block.fix_steps.is_some())
             .count()
     }
     pub(crate) const fn ok(&self) -> bool {
-        self.open() == 0 && self.problems.is_empty()
+        self.blocks_to_resolve() == 0 && self.problems.is_empty()
     }
 }
 
@@ -134,31 +135,31 @@ pub(crate) fn code_name(file: &str, section: Option<&str>) -> String {
     }
 }
 
-fn describe(code: &MarkedCode) -> String {
-    code_name(&code.file, code.section.as_deref())
+fn describe_code(marked_code: &MarkedCode) -> String {
+    code_name(&marked_code.file, marked_code.section.as_deref())
 }
 
-fn location(block_eval: &BlockEval) -> String {
+fn block_location(block_eval: &BlockEval) -> String {
     format!("modules/{}.adoc:{}", block_eval.block.module, block_eval.block.line)
 }
 
-fn closest(candidate: &CandidateInfo) -> Closest {
+fn closest_from_candidate(candidate: &CandidateInfo) -> Closest {
     match candidate.kind {
         "unmarked-file" => Closest::UnmarkedFile {
             file: candidate.file.clone(),
-            diff: LineDiff::new(&candidate.doc, &candidate.content),
+            line_diff: LineDiff::new(&candidate.doc, &candidate.content),
         },
         "lines" => {
-            let (from, to) = candidate.lines.unwrap_or_default();
+            let (first_line, last_line) = candidate.lines.unwrap_or_default();
             Closest::Lines {
                 file: candidate.file.clone(),
-                from,
-                to,
+                first_line,
+                last_line,
             }
         }
         _ => Closest::Marked {
             name: code_name(&candidate.file, candidate.name.as_deref()),
-            diff: LineDiff::new(&candidate.doc, &candidate.content),
+            line_diff: LineDiff::new(&candidate.doc, &candidate.content),
         },
     }
 }
@@ -170,55 +171,68 @@ fn fix_steps(candidate: &CandidateInfo) -> Option<Vec<String>> {
         .map(|plan| lightbulb::describe(plan, &candidate.file, candidate.name.as_deref()))
 }
 
-fn doc_label(block_eval: &BlockEval, doc_options: bool) -> String {
+fn doc_label(block_eval: &BlockEval, doc_options_applied: bool) -> String {
     format!(
         "doc: {}{}",
         block_eval.block.reference,
-        if doc_options { " (doc options applied)" } else { "" }
+        if doc_options_applied {
+            " (doc options applied)"
+        } else {
+            ""
+        }
     )
 }
 
-fn code_label(name: &str, options: bool) -> String {
-    format!("{name}{}", if options { " (marker options applied)" } else { "" })
+fn code_label(name: &str, marker_options_applied: bool) -> String {
+    format!(
+        "{name}{}",
+        if marker_options_applied {
+            " (marker options applied)"
+        } else {
+            ""
+        }
+    )
 }
 
-impl Summary {
+impl CheckSummary {
     pub(crate) fn build(asadoc_config: &AsadocConfig, evaluation: &Evaluation) -> Result<Self> {
         let unresolved = evaluation
             .assemblies
             .iter()
             .filter_map(unresolved_in_assembly)
             .collect();
-        let shown_code = shown_code_ids(evaluation);
-        let unused = evaluation
+        let shown_code_ids = shown_code_ids(evaluation);
+        let unused_code = evaluation
             .unused
             .iter()
-            .map(|&index| unused_code(evaluation, &shown_code, index))
+            .map(|&marked_index| describe_unused_code(evaluation, &shown_code_ids, marked_index))
             .filter_map(Result::transpose)
             .collect::<Result<_>>()
             .context("describing marked code no doc block matches")?;
 
         Ok(Self {
-            docs: asadoc_config.docs.describe(),
-            total: evaluation
+            docs_description: asadoc_config.docs.describe(),
+            total_blocks: evaluation
                 .assemblies
                 .iter()
                 .map(|assembly_eval| assembly_eval.blocks.len())
                 .sum(),
-            resolved: evaluation
+            resolved_blocks: evaluation
                 .blocks()
                 .filter(|(_, block_eval)| block_eval.resolved())
                 .count(),
-            ignored: evaluation
+            ignored_blocks: evaluation
                 .blocks()
                 .filter(|(_, block_eval)| block_eval.ignored_as.is_some())
                 .count(),
             unresolved,
-            unused,
+            unused_code,
             stale_ignored: evaluation
                 .stale_ignored
                 .iter()
-                .map(|(reason, content)| (reason.clone(), content.lines().next().unwrap_or("").to_owned()))
+                .map(|(reason, ignored_content)| {
+                    (reason.clone(), ignored_content.lines().next().unwrap_or("").to_owned())
+                })
                 .collect(),
             problems: evaluation.scan.problems.clone(),
         })
@@ -227,24 +241,24 @@ impl Summary {
 
 /// The blocks of an assembly still to resolve; None when there are none
 fn unresolved_in_assembly(assembly_eval: &AssemblyEval) -> Option<UnresolvedInAssembly> {
-    let blocks: Vec<UnresolvedBlock> = assembly_eval
+    let unresolved_blocks: Vec<UnresolvedBlock> = assembly_eval
         .blocks
         .iter()
         .filter(|block_eval| !block_eval.done())
         .map(|block_eval| {
-            let top = block_eval.candidates.first();
+            let top_candidate = block_eval.candidates.first();
             UnresolvedBlock {
                 reference: block_eval.block.reference.clone(),
-                location: location(block_eval),
-                closest: top.map(closest),
-                fix: top.and_then(fix_steps),
+                location: block_location(block_eval),
+                closest: top_candidate.map(closest_from_candidate),
+                fix_steps: top_candidate.and_then(fix_steps),
             }
         })
         .collect();
-    (!blocks.is_empty()).then(|| UnresolvedInAssembly {
+    (!unresolved_blocks.is_empty()).then(|| UnresolvedInAssembly {
         title: assembly_eval.assembly.title.clone(),
         path: assembly_eval.assembly.path.clone(),
-        blocks,
+        blocks: unresolved_blocks,
     })
 }
 
@@ -260,21 +274,32 @@ fn shown_code_ids(evaluation: &Evaluation) -> HashSet<String> {
 
 /// Marked code no block matches, by its index in `scan.marked`; None when it's
 /// already shown as some block's closest code
-fn unused_code(evaluation: &Evaluation, shown_code: &HashSet<String>, index: usize) -> Result<Option<Unused>> {
-    let code = evaluation.marked(index).context("looking up unmatched marked code")?;
-    if shown_code.contains(&code.id) {
+fn describe_unused_code(
+    evaluation: &Evaluation,
+    shown_code_ids: &HashSet<String>,
+    marked_index: usize,
+) -> Result<Option<UnusedCode>> {
+    let marked_code = evaluation
+        .marked(marked_index)
+        .context("looking up unmatched marked code")?;
+    if shown_code_ids.contains(&marked_code.id) {
         return Ok(None);
     }
-    let name = describe(code);
-    let closest = eval::closest_block(evaluation, code)
+    let name = describe_code(marked_code);
+    let closest_block = eval::closest_block(evaluation, marked_code)
         .with_context(|| format!("finding the doc block closest to {name}"))?
-        .map(|(block_eval, doc, filled)| (block_eval.block.reference.clone(), LineDiff::new(&doc, &filled)));
-    Ok(Some(Unused { name, closest }))
+        .map(|(block_eval, doc_text, filled_code)| {
+            (
+                block_eval.block.reference.clone(),
+                LineDiff::new(&doc_text, &filled_code),
+            )
+        });
+    Ok(Some(UnusedCode { name, closest_block }))
 }
 
 /// What checking one given block or piece of marked code found
 #[derive(Debug)]
-pub(crate) enum Outcome {
+pub(crate) enum CheckOutcome {
     NotFound {
         name: String,
     },
@@ -284,47 +309,47 @@ pub(crate) enum Outcome {
     },
     Resolved {
         reference: String,
-        codes: Vec<String>,
-        values: Values,
+        matched_codes: Vec<String>,
+        placeholder_values: Values,
     },
     /// No code matches the block; this is the closest
     Unmatched {
         reference: String,
         location: String,
         closest: Closest,
-        fix: Option<Vec<String>>,
+        fix_steps: Option<Vec<String>>,
         sides: Sides,
     },
     /// Nothing in the repo resembles the block
-    Alone {
+    NothingResembles {
         reference: String,
         location: String,
-        content: String,
+        block_content: String,
     },
     /// `--against` code that doesn't match the block
     Mismatch {
         reference: String,
         location: String,
-        code: String,
+        against_code: String,
         sides: Sides,
     },
     /// `--against` code whose doc options don't fit the block
     DocOptionsDontFit {
         reference: String,
-        code: String,
+        against_code: String,
     },
     CodeMatches {
         name: String,
-        blocks: Vec<String>,
+        matched_blocks: Vec<String>,
     },
     CodeUnmatched {
         name: String,
         /// The closest block: reference, location, diff
-        closest: Option<(String, String, Sides)>,
+        closest_block: Option<(String, String, Sides)>,
     },
 }
 
-impl Outcome {
+impl CheckOutcome {
     pub(crate) const fn ok(&self) -> bool {
         matches!(
             self,
@@ -335,36 +360,44 @@ impl Outcome {
 
 /// Marked code a command-line argument names: `path` (all marked code in the
 /// file), `path, section "name"` (as the report prints it) or `path#name`
-fn find_code<'a>(evaluation: &'a Evaluation, arg: &str) -> Vec<&'a MarkedCode> {
+fn find_marked_code<'a>(evaluation: &'a Evaluation, code_arg: &str) -> Vec<&'a MarkedCode> {
     evaluation
         .scan
         .marked
         .iter()
-        .filter(|code| code.id == arg || describe(code) == arg || code.file == arg)
+        .filter(|marked_code| {
+            marked_code.id == code_arg || describe_code(marked_code) == code_arg || marked_code.file == code_arg
+        })
         .collect()
 }
 
 /// Whether a block's match is with the given marked code
-fn is_match_with(evaluation: &Evaluation, code_match: &CodeMatch, code: &MarkedCode) -> bool {
+fn is_match_with(evaluation: &Evaluation, code_match: &CodeMatch, marked_code: &MarkedCode) -> bool {
     evaluation
         .marked(code_match.code)
-        .is_ok_and(|matched| matched.id == code.id)
+        .is_ok_and(|matched_code| matched_code.id == marked_code.id)
 }
 
-fn matches_code(evaluation: &Evaluation, block_eval: &BlockEval, code: &MarkedCode) -> bool {
+fn matches_code(evaluation: &Evaluation, block_eval: &BlockEval, marked_code: &MarkedCode) -> bool {
     block_eval
         .matches
         .iter()
-        .any(|code_match| is_match_with(evaluation, code_match, code))
+        .any(|code_match| is_match_with(evaluation, code_match, marked_code))
 }
 
-/// Checks blocks or marked code by name. With `against`, blocks are compared
-/// with that marked code instead of their closest.
-pub(crate) fn outcomes(evaluation: &Evaluation, names: &[String], against: Option<&str>) -> Result<Vec<Outcome>> {
-    let against = against.map(|arg| against_code(evaluation, arg)).transpose()?;
+/// Checks blocks or marked code by name. With `against_arg`, blocks are
+/// compared with that marked code instead of their closest.
+pub(crate) fn check_outcomes(
+    evaluation: &Evaluation,
+    names: &[String],
+    against_arg: Option<&str>,
+) -> Result<Vec<CheckOutcome>> {
+    let against_code = against_arg
+        .map(|code_arg| find_against_code(evaluation, code_arg))
+        .transpose()?;
     Ok(names
         .iter()
-        .map(|name| name_outcomes(evaluation, name, against))
+        .map(|name| name_outcomes(evaluation, name, against_code))
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .flatten()
@@ -372,138 +405,147 @@ pub(crate) fn outcomes(evaluation: &Evaluation, names: &[String], against: Optio
 }
 
 /// The one piece of marked code `--against` names
-fn against_code<'a>(evaluation: &'a Evaluation, arg: &str) -> Result<&'a MarkedCode> {
-    match find_code(evaluation, arg).as_slice() {
-        [code] => Ok(*code),
-        [] => bail!("no marked code named {arg}"),
-        _ => bail!("{arg} has several marked sections; name one as `{arg}, section \"<name>\"`"),
+fn find_against_code<'a>(evaluation: &'a Evaluation, code_arg: &str) -> Result<&'a MarkedCode> {
+    match find_marked_code(evaluation, code_arg).as_slice() {
+        [marked_code] => Ok(*marked_code),
+        [] => bail!("no marked code named {code_arg}"),
+        _ => bail!("{code_arg} has several marked sections; name one as `{code_arg}, section \"<name>\"`"),
     }
 }
 
 /// What checking the block, or all the marked code, a name refers to found
-fn name_outcomes(evaluation: &Evaluation, name: &str, against: Option<&MarkedCode>) -> Result<Vec<Outcome>> {
+fn name_outcomes(evaluation: &Evaluation, name: &str, against_code: Option<&MarkedCode>) -> Result<Vec<CheckOutcome>> {
     if let Some((_, block_eval)) = evaluation
         .blocks()
         .find(|(_, block_eval)| block_eval.block.reference == name)
     {
-        let outcome = match against {
-            Some(code) => block_against(evaluation, block_eval, code)
-                .with_context(|| format!("checking {name} against {}", describe(code)))?,
-            None => block(evaluation, block_eval).with_context(|| format!("checking {name}"))?,
+        let outcome = match against_code {
+            Some(marked_code) => block_outcome_against(evaluation, block_eval, marked_code)
+                .with_context(|| format!("checking {name} against {}", describe_code(marked_code)))?,
+            None => block_outcome(evaluation, block_eval).with_context(|| format!("checking {name}"))?,
         };
         return Ok(vec![outcome]);
     }
-    let codes = find_code(evaluation, name);
-    if codes.is_empty() {
-        return Ok(vec![Outcome::NotFound { name: name.to_owned() }]);
+    let named_codes = find_marked_code(evaluation, name);
+    if named_codes.is_empty() {
+        return Ok(vec![CheckOutcome::NotFound { name: name.to_owned() }]);
     }
-    codes
+    named_codes
         .into_iter()
-        .map(|code| code_outcome(evaluation, code).with_context(|| format!("checking {}", describe(code))))
+        .map(|marked_code| {
+            code_outcome(evaluation, marked_code).with_context(|| format!("checking {}", describe_code(marked_code)))
+        })
         .collect()
 }
 
-fn block_against(evaluation: &Evaluation, block_eval: &BlockEval, code: &MarkedCode) -> Result<Outcome> {
+fn block_outcome_against(
+    evaluation: &Evaluation,
+    block_eval: &BlockEval,
+    against_code: &MarkedCode,
+) -> Result<CheckOutcome> {
     let reference = block_eval.block.reference.clone();
     if let Some(code_match) = block_eval
         .matches
         .iter()
-        .find(|code_match| is_match_with(evaluation, code_match, code))
+        .find(|code_match| is_match_with(evaluation, code_match, against_code))
     {
-        return Ok(Outcome::Resolved {
+        return Ok(CheckOutcome::Resolved {
             reference,
-            codes: vec![describe(code)],
-            values: code_match.values.clone(),
+            matched_codes: vec![describe_code(against_code)],
+            placeholder_values: code_match.values.clone(),
         });
     }
-    let Some((doc, filled)) = eval::compare(code, &block_eval.block)
-        .with_context(|| format!("comparing {} with {reference}", describe(code)))?
+    let Some((doc_text, filled_code)) = eval::compare(against_code, &block_eval.block)
+        .with_context(|| format!("comparing {} with {reference}", describe_code(against_code)))?
     else {
-        return Ok(Outcome::DocOptionsDontFit {
+        return Ok(CheckOutcome::DocOptionsDontFit {
             reference,
-            code: describe(code),
+            against_code: describe_code(against_code),
         });
     };
-    Ok(Outcome::Mismatch {
+    Ok(CheckOutcome::Mismatch {
         reference,
-        location: location(block_eval),
-        code: describe(code),
+        location: block_location(block_eval),
+        against_code: describe_code(against_code),
         sides: Sides {
-            doc,
-            doc_label: doc_label(block_eval, !code.doc_options.is_empty()),
-            code: filled,
-            code_label: code_label(&describe(code), !code.options.is_empty()),
+            doc_text,
+            doc_label: doc_label(block_eval, !against_code.doc_options.is_empty()),
+            code_text: filled_code,
+            code_label: code_label(&describe_code(against_code), !against_code.options.is_empty()),
         },
     })
 }
 
-fn block(evaluation: &Evaluation, block_eval: &BlockEval) -> Result<Outcome> {
+fn block_outcome(evaluation: &Evaluation, block_eval: &BlockEval) -> Result<CheckOutcome> {
     let reference = block_eval.block.reference.clone();
     if let Some(reason) = &block_eval.ignored_as {
-        return Ok(Outcome::Ignored {
+        return Ok(CheckOutcome::Ignored {
             reference,
             reason: reason.clone(),
         });
     }
-    if let Some(first) = block_eval.matches.first() {
-        let codes = block_eval
+    if let Some(first_match) = block_eval.matches.first() {
+        let matched_codes = block_eval
             .matches
             .iter()
-            .map(|code_match| evaluation.marked(code_match.code).map(describe))
+            .map(|code_match| evaluation.marked(code_match.code).map(describe_code))
             .collect::<Result<Vec<_>>>()
             .with_context(|| format!("describing the code {reference} matches"))?;
-        return Ok(Outcome::Resolved {
+        return Ok(CheckOutcome::Resolved {
             reference,
-            codes,
-            values: first.values.clone(),
+            matched_codes,
+            placeholder_values: first_match.values.clone(),
         });
     }
-    let Some(top) = block_eval.candidates.first() else {
-        return Ok(Outcome::Alone {
+    let Some(top_candidate) = block_eval.candidates.first() else {
+        return Ok(CheckOutcome::NothingResembles {
             reference,
-            location: location(block_eval),
-            content: block_eval.block.content.clone(),
+            location: block_location(block_eval),
+            block_content: block_eval.block.content.clone(),
         });
     };
-    Ok(Outcome::Unmatched {
+    Ok(CheckOutcome::Unmatched {
         reference,
-        location: location(block_eval),
-        closest: closest(top),
-        fix: fix_steps(top),
+        location: block_location(block_eval),
+        closest: closest_from_candidate(top_candidate),
+        fix_steps: fix_steps(top_candidate),
         sides: Sides {
-            doc: top.doc.clone(),
-            doc_label: doc_label(block_eval, !top.doc_options.is_empty()),
-            code: top.content.clone(),
-            code_label: code_label(&code_name(&top.file, top.name.as_deref()), !top.options.is_empty()),
+            doc_text: top_candidate.doc.clone(),
+            doc_label: doc_label(block_eval, !top_candidate.doc_options.is_empty()),
+            code_text: top_candidate.content.clone(),
+            code_label: code_label(
+                &code_name(&top_candidate.file, top_candidate.name.as_deref()),
+                !top_candidate.options.is_empty(),
+            ),
         },
     })
 }
 
-fn code_outcome(evaluation: &Evaluation, code: &MarkedCode) -> Result<Outcome> {
-    let name = describe(code);
-    let blocks: Vec<String> = evaluation
+fn code_outcome(evaluation: &Evaluation, marked_code: &MarkedCode) -> Result<CheckOutcome> {
+    let name = describe_code(marked_code);
+    let matched_blocks: Vec<String> = evaluation
         .blocks()
-        .filter(|(_, block_eval)| matches_code(evaluation, block_eval, code))
+        .filter(|(_, block_eval)| matches_code(evaluation, block_eval, marked_code))
         .map(|(_, block_eval)| block_eval.block.reference.clone())
         .collect();
-    if !blocks.is_empty() {
-        return Ok(Outcome::CodeMatches { name, blocks });
+    if !matched_blocks.is_empty() {
+        return Ok(CheckOutcome::CodeMatches { name, matched_blocks });
     }
-    let closest = eval::closest_block(evaluation, code)
+    let closest_block = eval::closest_block(evaluation, marked_code)
         .with_context(|| format!("finding the doc block closest to {name}"))?
-        .map(|(block_eval, doc, filled)| {
+        .map(|(block_eval, doc_text, filled_code)| {
             (
                 block_eval.block.reference.clone(),
-                location(block_eval),
+                block_location(block_eval),
                 Sides {
-                    doc,
-                    doc_label: doc_label(block_eval, !code.doc_options.is_empty()),
-                    code: filled,
-                    code_label: code_label(&name, !code.options.is_empty()),
+                    doc_text,
+                    doc_label: doc_label(block_eval, !marked_code.doc_options.is_empty()),
+                    code_text: filled_code,
+                    code_label: code_label(&name, !marked_code.options.is_empty()),
                 },
             )
         });
-    Ok(Outcome::CodeUnmatched { name, closest })
+    Ok(CheckOutcome::CodeUnmatched { name, closest_block })
 }
 
 /// What `asadoc fix` did
@@ -512,7 +554,7 @@ pub(crate) enum FixOutcome {
     AlreadyDone,
     NoFix,
     Applied {
-        file: String,
+        changed_file: String,
         steps: Vec<String>,
         resolved: bool,
     },
@@ -543,11 +585,11 @@ pub(crate) fn fix(config: &AsadocConfig, reference: &str) -> Result<FixOutcome> 
     };
     lightbulb::apply(&config.repo_root, &candidate.file, candidate.name.as_deref(), plan)
         .with_context(|| format!("changing {}", candidate.file))?;
-    let after = eval::evaluate(config, false).context("checking the block again")?;
+    let reevaluation = eval::evaluate(config, false).context("checking the block again")?;
     Ok(FixOutcome::Applied {
-        file: candidate.file.clone(),
+        changed_file: candidate.file.clone(),
         steps: lightbulb::describe(plan, &candidate.file, candidate.name.as_deref()),
-        resolved: after
+        resolved: reevaluation
             .blocks()
             .any(|(_, block_eval)| block_eval.block.reference == reference && block_eval.resolved()),
     })

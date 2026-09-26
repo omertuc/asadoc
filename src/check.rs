@@ -9,44 +9,55 @@ use similar::TextDiff;
 use crate::config::AsadocConfig;
 use crate::eval::Evaluation;
 use crate::repo::Problem;
-use crate::report::{self, Closest, FixOutcome, LineDiff, Outcome, Sides, Summary, UnresolvedInAssembly, Unused};
+use crate::report::{
+    self, CheckOutcome, CheckSummary, Closest, FixOutcome, LineDiff, Sides, UnresolvedInAssembly, UnusedCode,
+};
 use anyhow::{Context, Result};
 
-fn plural(count: usize, one: &str, many: &str) -> String {
-    format!("{count} {}", if count == 1 { one } else { many })
+fn plural(count: usize, singular: &str, plural_form: &str) -> String {
+    format!("{count} {}", if count == 1 { singular } else { plural_form })
 }
 
 /// A line difference, in words
-fn line_diff(diff: LineDiff) -> String {
-    let total = plural(diff.doc_lines, "line", "lines");
-    match (diff.differ, diff.extra.saturating_sub(diff.differ)) {
+fn describe_line_diff(line_diff: LineDiff) -> String {
+    let doc_lines_in_words = plural(line_diff.doc_line_count, "line", "lines");
+    match (
+        line_diff.differing_lines,
+        line_diff.extra_code_lines.saturating_sub(line_diff.differing_lines),
+    ) {
         (0, 0) => "same lines, but not the same text (line endings or placeholders)".to_owned(),
-        (0, more) => format!("the code has {} more", plural(more, "line", "lines")),
-        (differ, 0) => format!("{differ} of {total} differ"),
-        (differ, more) => format!("{differ} of {total} differ, and the code has {more} more"),
+        (0, more_code_lines) => format!("the code has {} more", plural(more_code_lines, "line", "lines")),
+        (differing_lines, 0) => format!("{differing_lines} of {doc_lines_in_words} differ"),
+        (differing_lines, more_code_lines) => {
+            format!("{differing_lines} of {doc_lines_in_words} differ, and the code has {more_code_lines} more")
+        }
     }
 }
 
-fn closest(closest_code: &Closest) -> String {
+fn describe_closest(closest_code: &Closest) -> String {
     match closest_code {
-        Closest::Marked { name, diff } => format!("{name} (marked; {})", line_diff(*diff)),
-        Closest::UnmarkedFile { file, diff } => format!(
+        Closest::Marked { name, line_diff } => format!("{name} (marked; {})", describe_line_diff(*line_diff)),
+        Closest::UnmarkedFile { file, line_diff } => format!(
             "{file} (not marked; {} of the block's {} lines aren't in it)",
-            diff.differ, diff.doc_lines
+            line_diff.differing_lines, line_diff.doc_line_count
         ),
-        Closest::Lines { file, from, to } => format!("{file}, lines {from}-{to} (not marked)"),
+        Closest::Lines {
+            file,
+            first_line,
+            last_line,
+        } => format!("{file}, lines {first_line}-{last_line} (not marked)"),
     }
 }
 
 /// Bold and underlined when printing to a terminal
-fn heading(title: &str, aside: &str) {
-    let styled = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
+fn print_heading(title: &str, aside: &str) {
+    let use_terminal_style = io::stdout().is_terminal() && env::var_os("NO_COLOR").is_none();
     let aside = if aside.is_empty() {
         String::new()
     } else {
         format!("  ({aside})")
     };
-    if styled {
+    if use_terminal_style {
         println!("\n\x1b[1;4m{title}\x1b[0m{aside}");
     } else {
         println!("\n{title}{aside}\n{}", "─".repeat(title.chars().count()));
@@ -54,68 +65,74 @@ fn heading(title: &str, aside: &str) {
 }
 
 fn print_diff(sides: &Sides) {
-    let lines = |text: &str| plural(text.lines().count(), "line", "lines");
-    let doc_label = format!("{}, {}", sides.doc_label, lines(&sides.doc));
-    let code_label = format!("{}, {}", sides.code_label, lines(&sides.code));
-    let diff = TextDiff::from_lines(&sides.doc, &sides.code);
+    let line_count = |text: &str| plural(text.lines().count(), "line", "lines");
+    let doc_label = format!("{}, {}", sides.doc_label, line_count(&sides.doc_text));
+    let code_label = format!("{}, {}", sides.code_label, line_count(&sides.code_text));
+    let text_diff = TextDiff::from_lines(&sides.doc_text, &sides.code_text);
     print!(
         "{}",
-        diff.unified_diff().context_radius(3).header(&doc_label, &code_label)
+        text_diff
+            .unified_diff()
+            .context_radius(3)
+            .header(&doc_label, &code_label)
     );
 }
 
 /// `asadoc check`: the whole picture; false when anything needs attention
 pub(crate) fn check_all(config: &AsadocConfig, evaluation: &Evaluation) -> Result<bool> {
-    let summary = Summary::build(config, evaluation).context("summarizing the evaluation")?;
+    let summary = CheckSummary::build(config, evaluation).context("summarizing the evaluation")?;
     print_summary(&summary);
     Ok(summary.ok())
 }
 
-fn print_summary(summary: &Summary) {
-    let open = summary.open();
-    println!("Docs: {}", summary.docs);
+fn print_summary(summary: &CheckSummary) {
+    let blocks_to_resolve = summary.blocks_to_resolve();
+    println!("Docs: {}", summary.docs_description);
     println!(
-        "{}: {} match marked code in this repo, {} are ignored, {open} {} still to resolve.",
-        plural(summary.total, "doc code block", "doc code blocks"),
-        summary.resolved,
-        summary.ignored,
-        if open == 1 { "is" } else { "are" }
+        "{}: {} match marked code in this repo, {} are ignored, {blocks_to_resolve} {} still to resolve.",
+        plural(summary.total_blocks, "doc code block", "doc code blocks"),
+        summary.resolved_blocks,
+        summary.ignored_blocks,
+        if blocks_to_resolve == 1 { "is" } else { "are" }
     );
     summary.unresolved.iter().for_each(print_unresolved);
-    print_unused(&summary.unused);
+    print_unused(&summary.unused_code);
     print_stale_ignored(&summary.stale_ignored);
     print_problems(&summary.problems);
     print_next_steps(summary);
 }
 
 fn print_unresolved(assembly: &UnresolvedInAssembly) {
-    heading(&assembly.title, &assembly.path);
+    print_heading(&assembly.title, &assembly.path);
     for block in &assembly.blocks {
         println!("  ✗ {}", block.reference);
         println!("      doc:     {}", block.location);
         match &block.closest {
-            Some(closest_code) => println!("      closest: {}", closest(closest_code)),
+            Some(closest_code) => println!("      closest: {}", describe_closest(closest_code)),
             None => println!("      closest: nothing in the repo resembles it"),
         }
-        if let Some(steps) = &block.fix {
+        if let Some(fix_steps) = &block.fix_steps {
             println!(
                 "      fix:     `asadoc fix {}` would {}",
                 block.reference,
-                steps.join(", then ")
+                fix_steps.join(", then ")
             );
         }
     }
 }
 
-fn print_unused(unused: &[Unused]) {
-    if unused.is_empty() {
+fn print_unused(unused_code: &[UnusedCode]) {
+    if unused_code.is_empty() {
         return;
     }
-    heading("Marked code that no doc block matches", "");
-    for code in unused {
-        println!("  ! {}", code.name);
-        match &code.closest {
-            Some((reference, diff)) => println!("      closest doc block: {reference} ({})", line_diff(*diff)),
+    print_heading("Marked code that no doc block matches", "");
+    for marked_code in unused_code {
+        println!("  ! {}", marked_code.name);
+        match &marked_code.closest_block {
+            Some((reference, line_diff)) => println!(
+                "      closest doc block: {reference} ({})",
+                describe_line_diff(*line_diff)
+            ),
             None => println!("      closest doc block: none resembles it"),
         }
     }
@@ -126,7 +143,7 @@ fn print_stale_ignored(stale_ignored: &[(String, String)]) {
     if stale_ignored.is_empty() {
         return;
     }
-    heading("Ignored content that no doc block has anymore", "");
+    print_heading("Ignored content that no doc block has anymore", "");
     for (reason, first_line) in stale_ignored {
         println!("  - {reason}: {first_line}");
     }
@@ -137,96 +154,104 @@ fn print_problems(problems: &[Problem]) {
     if problems.is_empty() {
         return;
     }
-    heading("Markers that can't be read", "");
+    print_heading("Markers that can't be read", "");
     for problem in problems {
         println!("  ! {}: {}", problem.file, problem.message);
     }
 }
 
 /// The all-clear, or what to do next
-fn print_next_steps(summary: &Summary) {
+fn print_next_steps(summary: &CheckSummary) {
     if summary.ok() {
         println!("\n✓ Every doc code block matches marked code or is ignored.");
         return;
     }
     println!();
-    if summary.open() > 0 {
+    if summary.blocks_to_resolve() > 0 {
         println!("Resolve each ✗ block: make repo code match it, or ignore it if it doesn't come from this repo.");
     }
     println!("  asadoc check <block>   how a block differs from its closest code");
     println!("  asadoc check <file>    how marked code differs from its closest doc block");
-    if summary.fixable() > 0 {
+    if summary.fixable_blocks() > 0 {
         println!("  asadoc fix <block>     make the change listed under the block");
     }
     println!("  asadoc guide           how markers and ignoring work");
 }
 
 /// `asadoc check <names>`: false unless everything given is resolved or ignored
-pub(crate) fn check_refs(evaluation: &Evaluation, names: &[String], against: Option<&str>) -> Result<bool> {
-    let outcomes = report::outcomes(evaluation, names, against)?;
+pub(crate) fn check_refs(evaluation: &Evaluation, names: &[String], against_arg: Option<&str>) -> Result<bool> {
+    let outcomes = report::check_outcomes(evaluation, names, against_arg)?;
     outcomes.iter().for_each(print_outcome);
-    Ok(outcomes.iter().all(Outcome::ok))
+    Ok(outcomes.iter().all(CheckOutcome::ok))
 }
 
-fn print_outcome(outcome: &Outcome) {
+fn print_outcome(outcome: &CheckOutcome) {
     match outcome {
-        Outcome::NotFound { name } => println!("✗ {name}: no doc block or marked code by that name"),
-        Outcome::Ignored { reference, reason } => println!("✓ {reference}: ignored ({reason})"),
-        Outcome::Resolved {
+        CheckOutcome::NotFound { name } => println!("✗ {name}: no doc block or marked code by that name"),
+        CheckOutcome::Ignored { reference, reason } => println!("✓ {reference}: ignored ({reason})"),
+        CheckOutcome::Resolved {
             reference,
-            codes,
-            values,
+            matched_codes,
+            placeholder_values,
         } => {
-            println!("✓ {reference}: resolved (matches {})", codes.join("; "));
-            for (placeholder, value) in values {
+            println!("✓ {reference}: resolved (matches {})", matched_codes.join("; "));
+            for (placeholder, value) in placeholder_values {
                 println!("    {placeholder} = {value:?}");
             }
         }
-        Outcome::Unmatched {
+        CheckOutcome::Unmatched {
             reference,
             location,
             closest: closest_code,
-            fix,
+            fix_steps,
             sides,
         } => {
             println!(
                 "✗ {reference} ({location}): no marked code matches it; the closest is {}",
-                closest(closest_code)
+                describe_closest(closest_code)
             );
-            if let Some(steps) = fix {
-                println!("  `asadoc fix {reference}` would {}", steps.join(", then "));
+            if let Some(fix_steps) = fix_steps {
+                println!("  `asadoc fix {reference}` would {}", fix_steps.join(", then "));
             }
             print_diff(sides);
         }
-        Outcome::Alone {
+        CheckOutcome::NothingResembles {
             reference,
             location,
-            content,
+            block_content,
         } => {
             println!(
                 "✗ {reference} ({location}): no marked code matches it, and nothing in the repo resembles it. The block:"
             );
-            print!("----\n{content}----\n");
+            print!("----\n{block_content}----\n");
         }
-        Outcome::Mismatch {
+        CheckOutcome::Mismatch {
             reference,
             location,
-            code,
+            against_code,
             sides,
         } => {
-            println!("✗ {reference} ({location}): {code} doesn't match it");
+            println!("✗ {reference} ({location}): {against_code} doesn't match it");
             print_diff(sides);
         }
-        Outcome::DocOptionsDontFit { reference, code } => {
-            println!("✗ {reference}: the doc options of {code} don't fit this block");
+        CheckOutcome::DocOptionsDontFit {
+            reference,
+            against_code,
+        } => {
+            println!("✗ {reference}: the doc options of {against_code} don't fit this block");
         }
-        Outcome::CodeMatches { name, blocks } => println!("✓ {name}: matches {}", blocks.join(", ")),
-        Outcome::CodeUnmatched { name, closest: None } => {
+        CheckOutcome::CodeMatches { name, matched_blocks } => {
+            println!("✓ {name}: matches {}", matched_blocks.join(", "));
+        }
+        CheckOutcome::CodeUnmatched {
+            name,
+            closest_block: None,
+        } => {
             println!("✗ {name}: no doc block resembles it; if the docs no longer show it, remove its markers");
         }
-        Outcome::CodeUnmatched {
+        CheckOutcome::CodeUnmatched {
             name,
-            closest: Some((reference, location, sides)),
+            closest_block: Some((reference, location, sides)),
         } => {
             println!("✗ {name}: no doc block matches it; the closest is {reference} ({location})");
             print_diff(sides);
@@ -242,14 +267,20 @@ pub(crate) fn fix(config: &AsadocConfig, reference: &str) -> Result<bool> {
         FixOutcome::NoFix => {
             println!("✗ {reference}: there's no simple fix for it; see how it differs with `asadoc check {reference}`");
         }
-        FixOutcome::Applied { file, steps, resolved } => {
+        FixOutcome::Applied {
+            changed_file,
+            steps,
+            resolved,
+        } => {
             for step in steps {
                 println!("  {step}");
             }
             if *resolved {
                 println!("✓ {reference}: resolved");
             } else {
-                println!("✗ {reference}: changed {file}, but it still doesn't match; see `asadoc check {reference}`");
+                println!(
+                    "✗ {reference}: changed {changed_file}, but it still doesn't match; see `asadoc check {reference}`"
+                );
             }
         }
     }
