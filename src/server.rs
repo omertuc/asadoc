@@ -32,24 +32,24 @@ use tokio::time::timeout;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::BroadcastStream;
 
-const INDEX: &str = include_str!("../ui/index.html");
+const INDEX_HTML: &str = include_str!("../ui/index.html");
 const APP_JS: &str = include_str!("../ui/app.mjs");
 const APP_CSS: &str = include_str!("../ui/app.css");
-const GUIDE: &str = include_str!("../GUIDE.md");
+const GUIDE_MARKDOWN: &str = include_str!("../GUIDE.md");
 
 struct AppState {
     config: AsadocConfig,
-    changes: broadcast::Sender<()>,
+    change_sender: broadcast::Sender<()>,
 }
 
-type Shared = Arc<AppState>;
+type SharedState = Arc<AppState>;
 
 pub(crate) fn serve(config: AsadocConfig, port: u16) -> Result<()> {
     let runtime = Runtime::new().context("starting the async runtime")?;
     runtime.block_on(async move {
-        let (changes, _) = broadcast::channel(16);
-        let state = Arc::new(AppState { config, changes });
-        let _watcher = watch(Arc::clone(&state)).context("watching the repos for changes")?;
+        let (change_sender, _) = broadcast::channel(16);
+        let state = Arc::new(AppState { config, change_sender });
+        let _watcher = watch_repos(Arc::clone(&state)).context("watching the repos for changes")?;
         let listener = TcpListener::bind(("127.0.0.1", port))
             .await
             .with_context(|| format!("listening on port {port}"))?;
@@ -59,11 +59,11 @@ pub(crate) fn serve(config: AsadocConfig, port: u16) -> Result<()> {
     })
 }
 
-fn router(state: Shared) -> Router {
+fn router(state: SharedState) -> Router {
     Router::new()
         .route(
             "/",
-            get(|| async { ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], INDEX) }),
+            get(|| async { ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], INDEX_HTML) }),
         )
         .route(
             "/app.mjs",
@@ -75,16 +75,16 @@ fn router(state: Shared) -> Router {
         )
         .route(
             "/guide",
-            get(|| async { ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], GUIDE) }),
+            get(|| async { ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], GUIDE_MARKDOWN) }),
         )
-        .route("/api/data", get(data))
-        .route("/api/module", get(module))
-        .route("/api/file", get(file))
-        .route("/api/events", get(events))
-        .route("/api/fix", post(fix))
-        .route("/api/ignore", post(ignore))
-        .route("/api/unignore", post(unignore))
-        .route("/api/remove-ignored", post(remove_ignored))
+        .route("/api/data", get(serve_data))
+        .route("/api/module", get(serve_module))
+        .route("/api/file", get(serve_file))
+        .route("/api/events", get(serve_events))
+        .route("/api/fix", post(apply_fix))
+        .route("/api/ignore", post(ignore_block))
+        .route("/api/unignore", post(unignore_block))
+        .route("/api/remove-ignored", post(remove_ignored_content))
         .with_state(state)
 }
 
@@ -92,7 +92,7 @@ fn router(state: Shared) -> Router {
 // Live updates: tell open pages when either repo changes
 // ---------------------------------------------------------------------------
 
-fn watch(state: Shared) -> Result<RecommendedWatcher> {
+fn watch_repos(state: SharedState) -> Result<RecommendedWatcher> {
     let (raw_changes_sender, raw_changes) = mpsc::unbounded_channel::<()>();
     let mut watcher = recommended_watcher(move |event: notify::Result<notify::Event>| {
         let event = match event {
@@ -113,12 +113,12 @@ fn watch(state: Shared) -> Result<RecommendedWatcher> {
         .watch(repo_root, RecursiveMode::Recursive)
         .with_context(|| format!("watching {}", repo_root.display()))?;
     // Docs from git are fixed at the fetched commit
-    if let Some(modules) = state.config.docs.local_modules_dir() {
+    if let Some(modules_dir) = state.config.docs.local_modules_dir() {
         watcher
-            .watch(&modules, RecursiveMode::NonRecursive)
-            .with_context(|| format!("watching {}", modules.display()))?;
+            .watch(&modules_dir, RecursiveMode::NonRecursive)
+            .with_context(|| format!("watching {}", modules_dir.display()))?;
     }
-    tokio::spawn(debounce(raw_changes, state));
+    tokio::spawn(debounce_changes(raw_changes, state));
     Ok(watcher)
 }
 
@@ -129,21 +129,21 @@ fn is_generated(path: &Path) -> bool {
 }
 
 /// One notification to open pages once changes settle
-async fn debounce(mut raw_changes: mpsc::UnboundedReceiver<()>, state: Shared) {
+async fn debounce_changes(mut raw_changes: mpsc::UnboundedReceiver<()>, state: SharedState) {
     while raw_changes.recv().await.is_some() {
         while timeout(Duration::from_millis(300), raw_changes.recv())
             .await
             .is_ok_and(|received| received.is_some())
         {}
         // Fails only when no page is listening
-        state.changes.send(()).ok();
+        state.change_sender.send(()).ok();
     }
 }
 
-async fn events(State(state): State<Shared>) -> impl IntoResponse {
-    let stream =
-        BroadcastStream::new(state.changes.subscribe()).map(|_| Ok::<_, Infallible>(Event::default().data("changed")));
-    Sse::new(stream).keep_alive(KeepAlive::default())
+async fn serve_events(State(state): State<SharedState>) -> impl IntoResponse {
+    let change_events = BroadcastStream::new(state.change_sender.subscribe())
+        .map(|_| Ok::<_, Infallible>(Event::default().data("changed")));
+    Sse::new(change_events).keep_alive(KeepAlive::default())
 }
 
 // ---------------------------------------------------------------------------
@@ -163,15 +163,15 @@ struct CodeRef {
     values: Option<Values>,
 }
 
-fn code_ref(code: &MarkedCode, values: Option<&Values>) -> CodeRef {
+fn code_ref(marked_code: &MarkedCode, values: Option<&Values>) -> CodeRef {
     CodeRef {
-        id: code.id.clone(),
-        file: code.file.clone(),
-        snippet: code.section.clone(),
-        lines: code.lines,
-        marker_lines: code.marker_lines.clone(),
-        options: code.options.clone(),
-        doc_options: code.doc_options.clone(),
+        id: marked_code.id.clone(),
+        file: marked_code.file.clone(),
+        snippet: marked_code.section.clone(),
+        lines: marked_code.lines,
+        marker_lines: marked_code.marker_lines.clone(),
+        options: marked_code.options.clone(),
+        doc_options: marked_code.doc_options.clone(),
         values: values.cloned(),
     }
 }
@@ -179,7 +179,8 @@ fn code_ref(code: &MarkedCode, values: Option<&Values>) -> CodeRef {
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct BlockData {
-    asm: String,
+    #[serde(rename = "asm")]
+    assembly_id: String,
     #[serde(rename = "ref")]
     reference: String,
     module: String,
@@ -194,7 +195,8 @@ struct BlockData {
     #[serde(skip_serializing_if = "Option::is_none")]
     formerly: Option<Vec<Formerly>>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    code: Option<Vec<CodeRef>>,
+    #[serde(rename = "code")]
+    matched_code: Option<Vec<CodeRef>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ignored_as: Option<String>,
 }
@@ -210,8 +212,9 @@ struct GuideData {
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Link {
-    asm: String,
+struct BlockLink {
+    #[serde(rename = "asm")]
+    assembly_id: String,
     #[serde(rename = "ref")]
     reference: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -224,24 +227,26 @@ struct Link {
 #[serde(rename_all = "camelCase")]
 struct CodeData {
     #[serde(flatten)]
-    code: CodeRef,
-    matched_by: Vec<Link>,
-    resembled_by: Vec<Link>,
+    code_ref: CodeRef,
+    matched_by: Vec<BlockLink>,
+    resembled_by: Vec<BlockLink>,
 }
 
 #[derive(Serialize)]
-struct Stale {
+struct StaleIgnored {
     reason: String,
     content: String,
 }
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
-struct Data {
+struct ReportData {
     guides: Vec<GuideData>,
-    total: usize,
-    stale_ignored: Vec<Stale>,
-    code: Vec<CodeData>,
+    #[serde(rename = "total")]
+    total_blocks: usize,
+    stale_ignored: Vec<StaleIgnored>,
+    #[serde(rename = "code")]
+    marked_code: Vec<CodeData>,
     problems: Vec<Problem>,
     /// Where the docs are, for people
     docs_location: String,
@@ -255,22 +260,22 @@ fn code_data(evaluation: &Evaluation) -> Vec<CodeData> {
         .marked
         .iter()
         .enumerate()
-        .map(|(index, code)| CodeData {
-            code: code_ref(code, None),
-            matched_by: matched_by(evaluation, index),
-            resembled_by: resembled_by(evaluation, code),
+        .map(|(code_index, marked_code)| CodeData {
+            code_ref: code_ref(marked_code, None),
+            matched_by: matched_by(evaluation, code_index),
+            resembled_by: resembled_by(evaluation, marked_code),
         })
         .collect()
 }
 
-/// The blocks that match the marked code at `index`
-fn matched_by(evaluation: &Evaluation, index: usize) -> Vec<Link> {
+/// The blocks that match the marked code at `code_index`
+fn matched_by(evaluation: &Evaluation, code_index: usize) -> Vec<BlockLink> {
     evaluation
         .blocks()
         .filter_map(|(assembly, block)| {
-            let code_match = block.matches.iter().find(|code_match| code_match.code == index)?;
-            Some(Link {
-                asm: assembly.assembly.id.clone(),
+            let code_match = block.matches.iter().find(|code_match| code_match.code == code_index)?;
+            Some(BlockLink {
+                assembly_id: assembly.assembly.id.clone(),
                 reference: block.block.reference.clone(),
                 values: Some(code_match.values.clone()),
                 similarity: None,
@@ -279,14 +284,17 @@ fn matched_by(evaluation: &Evaluation, index: usize) -> Vec<Link> {
         .collect()
 }
 
-/// The blocks that `code` is a candidate for
-fn resembled_by(evaluation: &Evaluation, code: &MarkedCode) -> Vec<Link> {
+/// The blocks that `marked_code` is a candidate for
+fn resembled_by(evaluation: &Evaluation, marked_code: &MarkedCode) -> Vec<BlockLink> {
     evaluation
         .blocks()
         .filter_map(|(assembly, block)| {
-            let candidate = block.candidates.iter().find(|candidate| candidate.id == code.id)?;
-            Some(Link {
-                asm: assembly.assembly.id.clone(),
+            let candidate = block
+                .candidates
+                .iter()
+                .find(|candidate| candidate.id == marked_code.id)?;
+            Some(BlockLink {
+                assembly_id: assembly.assembly.id.clone(),
                 reference: block.block.reference.clone(),
                 values: None,
                 similarity: Some(candidate.similarity),
@@ -295,7 +303,7 @@ fn resembled_by(evaluation: &Evaluation, code: &MarkedCode) -> Vec<Link> {
         .collect()
 }
 
-fn report(config: &AsadocConfig, evaluation: &Evaluation) -> Result<Data> {
+fn build_report(config: &AsadocConfig, evaluation: &Evaluation) -> Result<ReportData> {
     let guides = evaluation
         .assemblies
         .iter()
@@ -303,18 +311,18 @@ fn report(config: &AsadocConfig, evaluation: &Evaluation) -> Result<Data> {
             guide_data(evaluation, assembly).with_context(|| format!("reporting on {}", assembly.assembly.id))
         })
         .collect::<Result<_>>()?;
-    Ok(Data {
+    Ok(ReportData {
         guides,
-        total: evaluation.assemblies.iter().map(|assembly| assembly.blocks.len()).sum(),
+        total_blocks: evaluation.assemblies.iter().map(|assembly| assembly.blocks.len()).sum(),
         stale_ignored: evaluation
             .stale_ignored
             .iter()
-            .map(|(reason, content)| Stale {
+            .map(|(reason, content)| StaleIgnored {
                 reason: reason.clone(),
                 content: content.clone(),
             })
             .collect(),
-        code: code_data(evaluation),
+        marked_code: code_data(evaluation),
         problems: evaluation.scan.problems.clone(),
         docs_location: config.docs.describe(),
         links: config.links.clone(),
@@ -341,14 +349,14 @@ fn guide_data(evaluation: &Evaluation, assembly: &AssemblyEval) -> Result<GuideD
             .iter()
             .filter(|block| block.resolved())
             .map(|block| {
-                let code = block
+                let matched_code = block
                     .matches
                     .iter()
                     .map(|code_match| Ok(code_ref(evaluation.marked(code_match.code)?, Some(&code_match.values))))
                     .collect::<Result<_>>()
                     .with_context(|| format!("listing the code {} matches", block.block.reference))?;
                 Ok(BlockData {
-                    code: Some(code),
+                    matched_code: Some(matched_code),
                     ..block_data(assembly, block)
                 })
             })
@@ -368,7 +376,7 @@ fn guide_data(evaluation: &Evaluation, assembly: &AssemblyEval) -> Result<GuideD
 /// What every listing shows of a block
 fn block_data(assembly: &AssemblyEval, block: &BlockEval) -> BlockData {
     BlockData {
-        asm: assembly.assembly.id.clone(),
+        assembly_id: assembly.assembly.id.clone(),
         reference: block.block.reference.clone(),
         module: block.block.module.clone(),
         lang: block.block.lang.clone(),
@@ -379,7 +387,7 @@ fn block_data(assembly: &AssemblyEval, block: &BlockEval) -> BlockData {
         lead: block.block.lead.clone(),
         candidates: None,
         formerly: None,
-        code: None,
+        matched_code: None,
         ignored_as: None,
     }
 }
@@ -423,7 +431,7 @@ impl<T> WithStatus<T> for Result<T> {
 type ApiResult<T = Response> = Result<T, ApiError>;
 
 async fn with_evaluation<T: Send + 'static>(
-    state: &Shared,
+    state: &SharedState,
     respond: impl FnOnce(&AsadocConfig, Evaluation) -> ApiResult<T> + Send + 'static,
 ) -> ApiResult<T> {
     let state = Arc::clone(state);
@@ -435,53 +443,55 @@ async fn with_evaluation<T: Send + 'static>(
     .context("running the evaluation")?
 }
 
-async fn data(State(state): State<Shared>) -> ApiResult {
-    let data = with_evaluation(&state, |config, evaluation| {
-        Ok(report(config, &evaluation).context("building the report")?)
+async fn serve_data(State(state): State<SharedState>) -> ApiResult {
+    let report = with_evaluation(&state, |config, evaluation| {
+        Ok(build_report(config, &evaluation).context("building the report")?)
     })
     .await?;
-    Ok(Json(data).into_response())
+    Ok(Json(report).into_response())
 }
 
 #[derive(Deserialize)]
 struct ModuleQuery {
-    asm: String,
+    #[serde(rename = "asm")]
+    assembly_id: String,
     module: String,
 }
 
 /// A module's text and the attributes it needs, for rendering in the browser
-async fn module(State(state): State<Shared>, Query(query): Query<ModuleQuery>) -> ApiResult {
+async fn serve_module(State(state): State<SharedState>, Query(module_query): Query<ModuleQuery>) -> ApiResult {
     let config = &state.config;
-    let assembly = find_assembly(config, &query.asm)
+    let assembly_path = find_assembly(config, &module_query.assembly_id)
         .context("finding the assembly")?
-        .with_context(|| format!("no assembly {}", query.asm))
+        .with_context(|| format!("no assembly {}", module_query.assembly_id))
         .status(StatusCode::NOT_FOUND)?;
-    if !is_plain_module_name(&query.module) {
-        return Err(anyhow!("bad module name {:?}", query.module)).status(StatusCode::BAD_REQUEST);
+    if !is_plain_module_name(&module_query.module) {
+        return Err(anyhow!("bad module name {:?}", module_query.module)).status(StatusCode::BAD_REQUEST);
     }
-    let text = docs::module_for_rendering(&config.docs, &query.module)
-        .with_context(|| format!("reading the module {}", query.module))?
-        .with_context(|| format!("no module {}", query.module))
+    let module_text = docs::module_for_rendering(&config.docs, &module_query.module)
+        .with_context(|| format!("reading the module {}", module_query.module))?
+        .with_context(|| format!("no module {}", module_query.module))
         .status(StatusCode::NOT_FOUND)?;
-    let attributes = docs::assembly_attributes(&config.docs, assembly)
-        .with_context(|| format!("reading the attributes of {assembly}"))?;
-    Ok(Json(json!({ "text": text, "attributes": attributes })).into_response())
+    let attributes = docs::assembly_attributes(&config.docs, assembly_path)
+        .with_context(|| format!("reading the attributes of {assembly_path}"))?;
+    Ok(Json(json!({ "text": module_text, "attributes": attributes })).into_response())
 }
 
-/// The path of the assembly with the given `id`, if any
-fn find_assembly<'config>(config: &'config AsadocConfig, id: &str) -> Result<Option<&'config String>> {
-    for path in &config.assemblies {
-        let assembly =
-            docs::read_assembly(&config.docs, path).with_context(|| format!("reading the assembly {path}"))?;
-        if assembly.id == id {
-            return Ok(Some(path));
+/// The path of the assembly with the given `assembly_id`, if any
+fn find_assembly<'config>(config: &'config AsadocConfig, assembly_id: &str) -> Result<Option<&'config String>> {
+    for assembly_path in &config.assemblies {
+        let assembly = docs::read_assembly(&config.docs, assembly_path)
+            .with_context(|| format!("reading the assembly {assembly_path}"))?;
+        if assembly.id == assembly_id {
+            return Ok(Some(assembly_path));
         }
     }
     Ok(None)
 }
 
-fn is_plain_module_name(name: &str) -> bool {
-    name.chars()
+fn is_plain_module_name(module_name: &str) -> bool {
+    module_name
+        .chars()
         .all(|character| character.is_ascii_alphanumeric() || "_.-".contains(character))
 }
 
@@ -491,18 +501,18 @@ struct FileQuery {
 }
 
 /// A repo file's text; only plain relative paths inside the repo
-async fn file(State(state): State<Shared>, Query(query): Query<FileQuery>) -> ApiResult {
-    let is_plain_relative = Path::new(&query.path)
+async fn serve_file(State(state): State<SharedState>, Query(file_query): Query<FileQuery>) -> ApiResult {
+    let is_plain_relative = Path::new(&file_query.path)
         .components()
         .all(|component| matches!(component, Component::Normal(_)));
     if !is_plain_relative {
-        return Err(anyhow!("bad path {:?}", query.path)).status(StatusCode::BAD_REQUEST);
+        return Err(anyhow!("bad path {:?}", file_query.path)).status(StatusCode::BAD_REQUEST);
     }
-    let text = repo::read(&state.config.repo_root, &query.path)
-        .with_context(|| format!("reading {}", query.path))?
-        .with_context(|| format!("no text file {}", query.path))
+    let file_text = repo::read(&state.config.repo_root, &file_query.path)
+        .with_context(|| format!("reading {}", file_query.path))?
+        .with_context(|| format!("no text file {}", file_query.path))
         .status(StatusCode::NOT_FOUND)?;
-    Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], text).into_response())
+    Ok(([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], file_text).into_response())
 }
 
 // ---------------------------------------------------------------------------
@@ -511,15 +521,18 @@ async fn file(State(state): State<Shared>, Query(query): Query<FileQuery>) -> Ap
 
 #[derive(Deserialize)]
 struct BlockAction {
-    asm: String,
+    #[serde(rename = "asm")]
+    assembly_id: String,
     #[serde(rename = "ref")]
     reference: String,
-    id: Option<String>,
+    #[serde(rename = "id")]
+    candidate_id: Option<String>,
     reason: Option<String>,
-    replacing: Option<String>,
+    #[serde(rename = "replacing")]
+    replacing_content: Option<String>,
 }
 
-fn done() -> Response {
+fn success_response() -> Response {
     Json(json!({ "success": true })).into_response()
 }
 
@@ -529,26 +542,26 @@ fn find_block<'evaluation>(
     action: &BlockAction,
 ) -> ApiResult<&'evaluation BlockEval> {
     evaluation
-        .find(&action.asm, &action.reference)
+        .find(&action.assembly_id, &action.reference)
         .with_context(|| format!("doc block {} not found", action.reference))
         .status(StatusCode::NOT_FOUND)
 }
 
-async fn fix(State(state): State<Shared>, Json(action): Json<BlockAction>) -> ApiResult {
+async fn apply_fix(State(state): State<SharedState>, Json(action): Json<BlockAction>) -> ApiResult {
     with_evaluation(&state, move |config, evaluation| {
         let block = find_block(&evaluation, &action)?;
-        let id = action.id.unwrap_or_default();
-        let (candidate, plan) = block
+        let candidate_id = action.candidate_id.unwrap_or_default();
+        let (candidate, fix_plan) = block
             .candidates
             .iter()
-            .find(|candidate| candidate.id == id)
-            .and_then(|candidate| candidate.plan.as_ref().map(|plan| (candidate, plan)))
-            .with_context(|| format!("{id} has no fix for {} anymore", action.reference))
+            .find(|candidate| candidate.id == candidate_id)
+            .and_then(|candidate| candidate.plan.as_ref().map(|fix_plan| (candidate, fix_plan)))
+            .with_context(|| format!("{candidate_id} has no fix for {} anymore", action.reference))
             .status(StatusCode::CONFLICT)?;
-        lightbulb::apply(&config.repo_root, &candidate.file, candidate.name.as_deref(), plan)
-            .with_context(|| format!("applying the fix to {id}"))?;
-        println!("Fixed {id} for {}", action.reference);
-        Ok(done())
+        lightbulb::apply(&config.repo_root, &candidate.file, candidate.name.as_deref(), fix_plan)
+            .with_context(|| format!("applying the fix to {candidate_id}"))?;
+        println!("Fixed {candidate_id} for {}", action.reference);
+        Ok(success_response())
     })
     .await
 }
@@ -559,10 +572,10 @@ fn update_ignored(config: &AsadocConfig, change: impl FnOnce(&mut Ignored) -> Re
     change(&mut ignored_blocks)
 }
 
-async fn ignore(State(state): State<Shared>, Json(action): Json<BlockAction>) -> ApiResult {
+async fn ignore_block(State(state): State<SharedState>, Json(action): Json<BlockAction>) -> ApiResult {
     with_evaluation(&state, move |config, evaluation| {
         let reason = action.reason.clone().unwrap_or_default();
-        if !ignored::REASONS.contains(&reason.as_str()) {
+        if !ignored::IGNORE_REASONS.contains(&reason.as_str()) {
             return Err(anyhow!("invalid reason {reason:?}")).status(StatusCode::BAD_REQUEST);
         }
         let block = find_block(&evaluation, &action)?;
@@ -571,38 +584,43 @@ async fn ignore(State(state): State<Shared>, Json(action): Json<BlockAction>) ->
                 &block.block.content,
                 &reason,
                 &block.block.reference,
-                action.replacing.as_deref(),
+                action.replacing_content.as_deref(),
             )
         })
         .with_context(|| format!("ignoring {}", action.reference))?;
         println!("Ignored {} as {reason}", action.reference);
-        Ok(done())
+        Ok(success_response())
     })
     .await
 }
 
-async fn unignore(State(state): State<Shared>, Json(action): Json<BlockAction>) -> ApiResult {
+async fn unignore_block(State(state): State<SharedState>, Json(action): Json<BlockAction>) -> ApiResult {
     with_evaluation(&state, move |config, evaluation| {
         let block = evaluation
-            .find(&action.asm, &action.reference)
+            .find(&action.assembly_id, &action.reference)
             .filter(|block| block.ignored_as.is_some())
             .with_context(|| format!("{} isn't ignored", action.reference))
             .status(StatusCode::NOT_FOUND)?;
-        update_ignored(config, |ignored_blocks| ignored_blocks.remove(&block.block.content))
+        update_ignored(config, |ignored_blocks| ignored_blocks.unignore(&block.block.content))
             .with_context(|| format!("un-ignoring {}", action.reference))?;
         println!("Stopped ignoring {}", action.reference);
-        Ok(done())
+        Ok(success_response())
     })
     .await
 }
 
 #[derive(Deserialize)]
-struct RemoveIgnored {
+struct RemoveIgnoredRequest {
     content: String,
 }
 
-async fn remove_ignored(State(state): State<Shared>, Json(request): Json<RemoveIgnored>) -> ApiResult {
-    update_ignored(&state.config, |ignored_blocks| ignored_blocks.remove(&request.content))
-        .context("removing ignored content")?;
-    Ok(done())
+async fn remove_ignored_content(
+    State(state): State<SharedState>,
+    Json(request): Json<RemoveIgnoredRequest>,
+) -> ApiResult {
+    update_ignored(&state.config, |ignored_blocks| {
+        ignored_blocks.unignore(&request.content)
+    })
+    .context("removing ignored content")?;
+    Ok(success_response())
 }
