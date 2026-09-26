@@ -22,7 +22,7 @@ use std::process::ExitCode;
 /// Keeps docs code blocks and repo code in sync, through comment markers in the code.
 #[derive(Parser)]
 #[command(version)]
-struct Cli {
+struct AsadocCli {
     /// The config file (default: the nearest asadoc.yaml from here up)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
@@ -30,11 +30,11 @@ struct Cli {
     #[arg(long, global = true)]
     docs: Option<PathBuf>,
     #[command(subcommand)]
-    command: Command,
+    command: AsadocCommand,
 }
 
 #[derive(Subcommand)]
-enum Command {
+enum AsadocCommand {
     /// Report doc blocks still to resolve, unmatched marked code and marker
     /// problems (exits 1 if there are any). Given doc blocks or marked code
     /// (`path`, or `path, section "name"`), check just those, with a diff
@@ -69,15 +69,16 @@ fn main() -> ExitCode {
 }
 
 fn run() -> Result<bool> {
-    let cli = Cli::parse();
-    let load = || config::AsadocConfig::load(cli.config.as_deref(), cli.docs.as_deref()).context("loading the config");
+    let cli = AsadocCli::parse();
+    let load_config =
+        || config::AsadocConfig::load(cli.config.as_deref(), cli.docs.as_deref()).context("loading the config");
     match &cli.command {
-        Command::Guide => {
+        AsadocCommand::Guide => {
             print!("{}", include_str!("../GUIDE.md"));
             Ok(true)
         }
-        Command::Check { refs, against } => {
-            let config = load()?;
+        AsadocCommand::Check { refs, against } => {
+            let config = load_config()?;
             let evaluation = eval::evaluate(&config, true).context("evaluating the doc blocks")?;
             if refs.is_empty() {
                 check::check_all(&config, &evaluation).context("checking every doc block")
@@ -85,9 +86,9 @@ fn run() -> Result<bool> {
                 check::check_refs(&evaluation, refs, against.as_deref()).context("checking what was given")
             }
         }
-        Command::Fix { block } => check::fix(&load()?, block).with_context(|| format!("fixing {block}")),
-        Command::Serve { port } => {
-            server::serve(load()?, *port).context("serving the review UI")?;
+        AsadocCommand::Fix { block } => check::fix(&load_config()?, block).with_context(|| format!("fixing {block}")),
+        AsadocCommand::Serve { port } => {
+            server::serve(load_config()?, *port).context("serving the review UI")?;
             Ok(true)
         }
     }
