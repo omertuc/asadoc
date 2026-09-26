@@ -1,0 +1,71 @@
+[package]
+name = "asadoc"
+version = "0.2.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+axum = "0.8.9"
+clap = { version = "4.6.7", features = ["derive"] }
+fancy-regex = "0.19.2"
+notify = "8.2.0"
+regex = "1.13.1"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+serde_yaml = "0.9.34"
+similar = "3.2.0"
+tokio = { version = "1.53.1", features = ["full"] }
+tokio-stream = { version = "0.1.19", features = ["sync"] }
+
+[profile.release]
+strip = true
+
+[lints.rust]
+unsafe_code = "forbid"
+unused_qualifications = "warn"
+unused_crate_dependencies = "warn"
+unreachable_pub = "warn"
+missing_debug_implementations = "warn"
+rust_2018_idioms = { level = "warn", priority = -1 }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+cargo = { level = "warn", priority = -1 }
+multiple_crate_versions = "allow"
+cargo_common_metadata = "allow"
+# Conflicts with rustc's unreachable_pub
+redundant_pub_crate = "allow"
+# `map_or_else` with two closures reads worse than a two-arm match
+option_if_let_else = "allow"
+# No panics
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+unreachable = "deny"
+indexing_slicing = "deny"
+string_slice = "deny"
+panic_in_result_fn = "deny"
+get_unwrap = "deny"
+unwrap_in_result = "deny"
+exit = "deny"
+# Hygiene
+dbg_macro = "deny"
+map_err_ignore = "warn"
+let_underscore_must_use = "warn"
+str_to_string = "warn"
+clone_on_ref_ptr = "warn"
+rc_buffer = "warn"
+rest_pat_in_fully_bound_structs = "warn"
+self_named_module_files = "warn"
+semicolon_inside_block = "warn"
+tests_outside_test_module = "warn"
+undocumented_unsafe_blocks = "deny"
+unneeded_field_pattern = "warn"
+verbose_file_reads = "warn"
+if_then_some_else_none = "warn"
+lossy_float_literal = "warn"
+mixed_read_write_in_expression = "warn"
