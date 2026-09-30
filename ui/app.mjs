@@ -19,7 +19,7 @@ let data = null;
 let selectedKey = null;   // `${asm}:${ref}`
 let tab = 'todo';         // 'todo' | 'resolved' | 'ignored' | 'code'
 let query = '';
-let selectedCandidate = 0;    // index of the open recommendation
+let selectedCandidate = -1;   // index of the open recommendation, -1 when all are collapsed
 let rendered = [];        // pierre components to clean up
 
 const root = document.getElementById('root');
@@ -379,7 +379,7 @@ function renderCodeList(list) {
 
 function select(key) {
   selectedKey = key;
-  selectedCandidate = 0;
+  selectedCandidate = -1;
   history.replaceState(null, '', key ? `#${encodeURIComponent(key)}` : location.pathname);
   renderQueue();
   renderBlock();
