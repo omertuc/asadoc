@@ -409,14 +409,12 @@ mod tests {
                     "example-output",
                     "Docs often contain code blocks that simply show an example output of a terminal command. These of course usually have no correspondence in a repo so should be ignored."
                 ),
-                (
-                    "manual-command",
-                    "Docs often ask the user to run a command. If this command is long and complicated, maybe we also already have it in the code repo, so it should be marked and matched. But if it's simple (e.g. 'kubectl get pods') or specific to the docs, it should probably be ignored."
-                ),
+                ("manual-command", "Typed by hand"),
                 (
                     "no-repo-source",
                     "Some code blocks in the docs don't have a counterpart in the code repo, so they should be ignored."
                 ),
+                ("from-upstream", "Copied from upstream docs"),
             ]
         );
         assert_eq!(reloaded_blocks.reason_of("$ oc get nodes\n"), Some("example-output"));
