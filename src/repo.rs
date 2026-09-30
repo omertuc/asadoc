@@ -1,14 +1,11 @@
-//! The repo side: marked code, found by scanning the repo's files for markers.
+//! The repo side: marked code, found by scanning the files of every code
+//! source (this repo, and each `[[code]]`) for markers.
 
-use crate::config::AsadocConfig;
+use crate::config::{AsadocConfig, CodeSource};
 use crate::markers::{self, MarkedSection, MarkerHeader, MarkerOption, Markers, OptionSide};
 use crate::matching::Matcher;
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use serde::Serialize;
-use std::fs;
-use std::io::ErrorKind;
-use std::path::Path;
-use std::process::Command;
 use std::sync::Arc;
 
 /// Files whose comments start with `#`, so they can carry markers
@@ -34,61 +31,35 @@ pub(crate) fn can_hold_markers(file: &str) -> bool {
     HASH_COMMENT_EXTENSIONS.contains(&extension(file)) || is_makefile(file)
 }
 
-/// Text files tracked (or untracked but not ignored) in the repo, minus excluded paths
-fn repo_files(config: &AsadocConfig) -> Result<Vec<String>> {
-    let output = Command::new("git")
-        .args(["ls-files", "--cached", "--others", "--exclude-standard"])
-        .current_dir(&config.repo_root)
-        .output()
-        .context("running git ls-files")?;
-    if !output.status.success() {
-        bail!(
-            "git ls-files failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    let listing = String::from_utf8_lossy(&output.stdout);
-    listing
-        .lines()
-        .filter(|file| !file.is_empty() && !file.split('/').any(|path_component| path_component == "node_modules"))
-        .filter(|file| {
-            !config
-                .exclude
-                .iter()
-                .any(|excluded| file.starts_with(excluded.as_str()))
+/// The files of a code source that could hold marked code: text, small,
+/// and not excluded
+fn scanned_files(code_source: &CodeSource) -> Result<Vec<String>> {
+    Ok(code_source
+        .tree
+        .list_files()?
+        .into_iter()
+        .filter(|(file, size)| {
+            *size < MAX_SCANNED_FILE_SIZE
+                && !file.split('/').any(|path_component| path_component == "node_modules")
+                && !code_source
+                    .exclude
+                    .iter()
+                    .any(|excluded| file.starts_with(excluded.as_str()))
+                && (can_hold_markers(file) || OTHER_TEXT_EXTENSIONS.contains(&extension(file)))
         })
-        .filter(|file| can_hold_markers(file) || OTHER_TEXT_EXTENSIONS.contains(&extension(file)))
-        .map(|file| Ok(is_small_file(&config.repo_root.join(file))?.then(|| file.to_owned())))
-        .filter_map(Result::transpose)
-        .collect()
-}
-
-/// Whether `path` is a regular file small enough to scan; false when it's gone
-fn is_small_file(path: &Path) -> Result<bool> {
-    match fs::metadata(path) {
-        Ok(metadata) => Ok(metadata.is_file() && metadata.len() < MAX_SCANNED_FILE_SIZE),
-        // Deleted, but still in the index
-        Err(error) if error.kind() == ErrorKind::NotFound => Ok(false),
-        Err(error) => Err(error).with_context(|| format!("inspecting {}", path.display())),
-    }
-}
-
-/// A repo file's text; None when it's gone or isn't text
-pub(crate) fn read_repo_file(repo_root: &Path, file: &str) -> Result<Option<String>> {
-    let path = repo_root.join(file);
-    match fs::read_to_string(&path) {
-        Ok(text) => Ok(Some(text)),
-        Err(error) if matches!(error.kind(), ErrorKind::NotFound | ErrorKind::InvalidData) => Ok(None),
-        Err(error) => Err(error).with_context(|| format!("reading {}", path.display())),
-    }
+        .map(|(file, _)| file)
+        .collect())
 }
 
 /// A marked file, or a marked section of a file
 #[derive(Clone)]
 pub(crate) struct MarkedCode {
-    /// `path` or `path#section`
+    /// `file` or `file#section`
     pub id: String,
+    /// The file's name among all the code sources (see `CodeSource::qualify`)
     pub file: String,
+    /// Index into `AsadocConfig::code`
+    pub source_index: usize,
     pub section: Option<String>,
     /// The marked lines with the code-side options applied
     pub content: String,
@@ -105,7 +76,10 @@ pub(crate) struct MarkedCode {
 
 /// A repo file, for finding code to mark
 pub(crate) struct RepoFile {
+    /// Its name among all the code sources (see `CodeSource::qualify`)
     pub path: String,
+    /// Index into `AsadocConfig::code`
+    pub source_index: usize,
     pub text: String,
     pub markers: Markers,
 }
@@ -119,6 +93,7 @@ pub(crate) struct MarkerProblem {
 pub(crate) struct RepoScan {
     pub marked: Vec<MarkedCode>,
     pub files: Vec<RepoFile>,
+    /// This repo's (the other code sources' are theirs to report)
     pub problems: Vec<MarkerProblem>,
 }
 
@@ -144,33 +119,56 @@ pub(crate) fn scan(config: &AsadocConfig) -> Result<RepoScan> {
         files: vec![],
         problems: vec![],
     };
-    for file in repo_files(config).context("listing the repo's files")? {
-        let Some(text) = read_repo_file(&config.repo_root, &file)? else {
-            continue;
-        };
-        scan_file(&mut scan, file, text)?;
+    for (source_index, code_source) in config.code.iter().enumerate() {
+        let files = scanned_files(code_source).context("listing the files")?;
+        let texts = code_source.tree.read_all(&files).context("reading the files")?;
+        for (file, text) in files.iter().zip(texts) {
+            // Gone, or not text
+            let Some(text) = text else { continue };
+            scan_file(&mut scan, source_index, code_source.qualify(file), text)
+                .with_context(|| format!("scanning {}", code_source.describe()))?;
+        }
     }
     Ok(scan)
 }
 
 /// Adds a file's marked code, and the problems with its markers, to `scan`
-fn scan_file(scan: &mut RepoScan, file: String, text: String) -> Result<()> {
+fn scan_file(scan: &mut RepoScan, source_index: usize, file: String, text: String) -> Result<()> {
     let parsed_markers = markers::parse_markers(&text).with_context(|| format!("finding markers in {file}"))?;
-    scan.problems
-        .extend(parsed_markers.problems.iter().map(|message| MarkerProblem {
+    let mut marker_problems: Vec<MarkerProblem> = parsed_markers
+        .problems
+        .iter()
+        .map(|message| MarkerProblem {
             file: file.clone(),
             message: message.clone(),
-        }));
+        })
+        .collect();
     if let Some(header) = &parsed_markers.file {
-        add_marked(scan, &file, marked_file(&text, header)?)
-            .with_context(|| format!("reading the file marked in {file}"))?;
+        add_marked(
+            scan,
+            &mut marker_problems,
+            source_index,
+            &file,
+            marked_file(&text, header)?,
+        )
+        .with_context(|| format!("reading the file marked in {file}"))?;
     }
     for section in parsed_markers.sections.values() {
-        add_marked(scan, &file, marked_section(&text, section)?)
-            .with_context(|| format!("reading section \"{}\" of {file}", section.name))?;
+        add_marked(
+            scan,
+            &mut marker_problems,
+            source_index,
+            &file,
+            marked_section(&text, section)?,
+        )
+        .with_context(|| format!("reading section \"{}\" of {file}", section.name))?;
+    }
+    if source_index == 0 {
+        scan.problems.extend(marker_problems);
     }
     scan.files.push(RepoFile {
         path: file,
+        source_index,
         text,
         markers: parsed_markers,
     });
@@ -219,7 +217,13 @@ fn marked_section<'a>(text: &str, section: &'a MarkedSection) -> Result<Unapplie
 }
 
 /// Adds the marked code to `scan`, or a problem when its options can't be applied
-fn add_marked(scan: &mut RepoScan, file: &str, marked: UnappliedMarkedCode<'_>) -> Result<()> {
+fn add_marked(
+    scan: &mut RepoScan,
+    marker_problems: &mut Vec<MarkerProblem>,
+    source_index: usize,
+    file: &str,
+    marked: UnappliedMarkedCode<'_>,
+) -> Result<()> {
     let (repo_side_options, doc_side_options): (Vec<_>, Vec<_>) = marked
         .options
         .iter()
@@ -234,6 +238,7 @@ fn add_marked(scan: &mut RepoScan, file: &str, marked: UnappliedMarkedCode<'_>) 
                 matcher: Arc::new(matcher),
                 id: code_id(file, marked.section),
                 file: file.to_owned(),
+                source_index,
                 section: marked.section.map(str::to_owned),
                 content,
                 placeholders,
@@ -243,7 +248,7 @@ fn add_marked(scan: &mut RepoScan, file: &str, marked: UnappliedMarkedCode<'_>) 
                 marker_lines: marked.marker_lines,
             });
         }
-        Err(error) => scan.problems.push(MarkerProblem {
+        Err(error) => marker_problems.push(MarkerProblem {
             file: file.to_owned(),
             message: match marked.section {
                 Some(section) => format!("section \"{section}\": {error}"),

@@ -519,10 +519,9 @@ fn apply_fix(text: &str, section: Option<&str>, fix: &LightbulbFix, doc_options:
     }
 }
 
-/// Applies a lightbulb's changes to `file` (and its section, if any)
-pub(crate) fn apply(repo_root: &Path, file: &str, section: Option<&str>, plan: &LightbulbPlan) -> Result<()> {
-    let file_path = repo_root.join(file);
-    let original_text = fs::read_to_string(&file_path).with_context(|| format!("reading {}", file_path.display()))?;
+/// Applies a lightbulb's changes to the file at `file_path` (and its section, if any)
+pub(crate) fn apply(file_path: &Path, section: Option<&str>, plan: &LightbulbPlan) -> Result<()> {
+    let original_text = fs::read_to_string(file_path).with_context(|| format!("reading {}", file_path.display()))?;
     let (fixed_text, final_section) = plan.fixes.iter().try_fold(
         (original_text, section.map(str::to_owned)),
         |(text, current_section), fix| -> Result<_> {
@@ -539,6 +538,6 @@ pub(crate) fn apply(repo_root: &Path, file: &str, section: Option<&str>, plan: &
     } else {
         fixed_text
     };
-    fs::write(&file_path, final_text).with_context(|| format!("writing {}", file_path.display()))?;
+    fs::write(file_path, final_text).with_context(|| format!("writing {}", file_path.display()))?;
     Ok(())
 }

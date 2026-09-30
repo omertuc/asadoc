@@ -87,9 +87,28 @@ pub(crate) fn check_all(config: &AsadocConfig, evaluation: &Evaluation) -> Resul
 
 fn print_summary(summary: &CheckSummary) {
     let blocks_to_resolve = summary.blocks_to_resolve();
-    println!("Docs: {}", summary.docs_description);
+    match summary.docs_descriptions.as_slice() {
+        [docs_description] => println!("Docs: {docs_description}"),
+        docs_descriptions => {
+            println!("Docs:");
+            for docs_description in docs_descriptions {
+                println!("  {docs_description}");
+            }
+        }
+    }
+    if !summary.other_code_descriptions.is_empty() {
+        println!("Code: this repo, and");
+        for code_description in &summary.other_code_descriptions {
+            println!("  {code_description}");
+        }
+    }
+    let code_where = if summary.other_code_descriptions.is_empty() {
+        " in this repo"
+    } else {
+        ""
+    };
     println!(
-        "{}: {} match marked code in this repo, {} are ignored, {blocks_to_resolve} {} still to resolve.",
+        "{}: {} match marked code{code_where}, {} are ignored, {blocks_to_resolve} {} still to resolve.",
         plural(summary.total_blocks, "doc code block", "doc code blocks"),
         summary.resolved_blocks,
         summary.ignored_blocks,
@@ -109,7 +128,7 @@ fn print_unresolved(assembly: &UnresolvedInAssembly) {
         println!("      doc:     {}", block.location);
         match &block.closest {
             Some(closest_code) => println!("      closest: {}", describe_closest(closest_code)),
-            None => println!("      closest: nothing in the repo resembles it"),
+            None => println!("      closest: no marked code resembles it"),
         }
         if let Some(fix_steps) = &block.fix_steps {
             println!(
@@ -220,9 +239,7 @@ fn print_outcome(outcome: &CheckOutcome) {
             location,
             block_content,
         } => {
-            println!(
-                "✗ {reference} ({location}): no marked code matches it, and nothing in the repo resembles it. The block:"
-            );
+            println!("✗ {reference} ({location}): no marked code matches or resembles it. The block:");
             print!("----\n{block_content}----\n");
         }
         CheckOutcome::Mismatch {

@@ -26,9 +26,13 @@ struct AsadocCli {
     /// The config file (default: the nearest .asadoc/config.toml from here up)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
-    /// A local docs checkout, instead of the docs in the config
-    #[arg(long, global = true)]
-    docs: Option<PathBuf>,
+    /// A local docs checkout to read instead of the configured docs: `<dir>`,
+    /// or `<name>=<dir>` for one of several docs sources (repeatable)
+    #[arg(long, global = true, value_name = "[NAME=]DIR")]
+    docs: Vec<String>,
+    /// A local checkout to read instead of the `[[code]]` named NAME (repeatable)
+    #[arg(long, global = true, value_name = "NAME=DIR")]
+    code: Vec<String>,
     #[command(subcommand)]
     command: AsadocCommand,
 }
@@ -71,7 +75,7 @@ fn main() -> ExitCode {
 fn run() -> Result<bool> {
     let cli = AsadocCli::parse();
     let load_config =
-        || config::AsadocConfig::load(cli.config.as_deref(), cli.docs.as_deref()).context("loading the config");
+        || config::AsadocConfig::load(cli.config.as_deref(), &cli.docs, &cli.code).context("loading the config");
     match &cli.command {
         AsadocCommand::Guide => {
             print!("{}", include_str!("../GUIDE.md"));

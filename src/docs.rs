@@ -1,7 +1,8 @@
 //! The doc side: code blocks in the modules an `AsciiDoc` assembly includes.
 
+use crate::config::Docs;
 use crate::re::capture_group_text;
-use crate::source::DocsSource;
+use crate::source::Tree;
 use anyhow::{Context, Result};
 use regex::{Captures, Regex};
 use serde_yaml::{Mapping, Value};
@@ -15,7 +16,8 @@ pub(crate) struct DocBlock {
     pub language: String,
     /// 1-based position among the module's blocks of the same language
     pub position_in_language: usize,
-    /// `<module>/<language>-<NNN>`: a name for the block's current position only
+    /// `<module>/<language>-<NNN>` (after `<docs name>:` when there are
+    /// several docs sources): a name for the block's current position only
     pub reference: String,
     /// The lines between the `----` delimiters, ending with a newline
     pub content: String,
@@ -28,7 +30,10 @@ pub(crate) struct DocBlock {
 }
 
 pub(crate) struct Assembly {
+    /// Its file stem (after `<docs name>:` when there are several docs sources)
     pub id: String,
+    /// Index of its docs source in `AsadocConfig::docs`
+    pub docs_index: usize,
     /// Relative to the docs root
     pub path: String,
     pub title: String,
@@ -48,8 +53,10 @@ pub(crate) fn format_reference(module: &str, language: &str, position_in_languag
     format!("{module}/{language}-{position_in_language:03}")
 }
 
-pub(crate) fn read_assembly(docs: &DocsSource, path: &str) -> Result<Assembly> {
+/// The assembly at `path` in the docs source at `docs_index`
+pub(crate) fn read_assembly(docs: &Docs, docs_index: usize, path: &str) -> Result<Assembly> {
     let text = docs
+        .source
         .read(path)
         .with_context(|| format!("reading the assembly {path}"))?
         .with_context(|| format!("assembly {path} not found in the docs"))?;
@@ -67,7 +74,8 @@ pub(crate) fn read_assembly(docs: &DocsSource, path: &str) -> Result<Assembly> {
         None => file_stem.clone(),
     };
     Ok(Assembly {
-        id: file_stem,
+        id: docs.qualify(&file_stem),
+        docs_index,
         path: path.to_owned(),
         title,
         modules: unique_in_order(included),
@@ -127,8 +135,9 @@ fn next_position_in_language(last_position_by_language: &mut BTreeMap<String, us
 }
 
 /// A module's code blocks; none when the module doesn't exist
-pub(crate) fn extract_blocks(docs: &DocsSource, module: &str) -> Result<Vec<DocBlock>> {
+pub(crate) fn extract_blocks(docs: &Docs, module: &str) -> Result<Vec<DocBlock>> {
     let Some(text) = docs
+        .source
         .read(&module_path(module))
         .with_context(|| format!("reading the module {module}"))?
     else {
@@ -157,7 +166,7 @@ pub(crate) fn extract_blocks(docs: &DocsSource, module: &str) -> Result<Vec<DocB
             let position_in_language = next_position_in_language(&mut last_position_by_language, &language);
             blocks.push(DocBlock {
                 module: module.to_owned(),
-                reference: format_reference(module, &language, position_in_language),
+                reference: docs.qualify(&format_reference(module, &language, position_in_language)),
                 language,
                 position_in_language,
                 content: lines.get(content_start..close_delimiter).unwrap_or_default().join("\n") + "\n",
@@ -193,7 +202,7 @@ const RESOLVE_PASSES: usize = 5;
 /// Attributes for rendering a module of `assembly` standalone: product title and
 /// version (from `_distro_map.yml`, like `AsciiBinder`), the attribute files the
 /// assembly includes, and the assembly's own header entries.
-pub(crate) fn assembly_attributes(docs: &DocsSource, assembly: &str) -> Result<BTreeMap<String, String>> {
+pub(crate) fn assembly_attributes(docs: &Tree, assembly: &str) -> Result<BTreeMap<String, String>> {
     docs.prefetch(&[
         "_distro_map.yml".to_owned(),
         "_attributes".to_owned(),
@@ -217,7 +226,7 @@ pub(crate) fn assembly_attributes(docs: &DocsSource, assembly: &str) -> Result<B
 }
 
 /// Product title and version, from `_distro_map.yml`
-fn distro_attributes(docs: &DocsSource) -> Result<Vec<(String, String)>> {
+fn distro_attributes(docs: &Tree) -> Result<Vec<(String, String)>> {
     let Some(distro_map_text) = docs.read("_distro_map.yml").context("reading _distro_map.yml")? else {
         return Ok(vec![]);
     };
@@ -262,7 +271,7 @@ fn latest_enterprise_version(branches: &Mapping) -> Result<Option<(u32, u32)>> {
 /// The attribute entries above the assembly's first module, and those in the
 /// attribute files it includes there
 fn add_header_attributes(
-    docs: &DocsSource,
+    docs: &Tree,
     assembly: &str,
     text: &str,
     attributes: &mut BTreeMap<String, String>,
@@ -354,7 +363,7 @@ fn resolve_once(attribute_reference: &Regex, attributes: &BTreeMap<String, Strin
 }
 
 /// A module's text for rendering: its `//` comment lines removed; None when there's no such module
-pub(crate) fn module_for_rendering(docs: &DocsSource, module: &str) -> Result<Option<String>> {
+pub(crate) fn module_for_rendering(docs: &Tree, module: &str) -> Result<Option<String>> {
     let text = docs
         .read(&module_path(module))
         .with_context(|| format!("reading the module {module}"))?;

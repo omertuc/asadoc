@@ -9,17 +9,13 @@ const asciidoctor = Asciidoctor();
 // a lightbulb fix), or ignored when no repo code should match it. Resolved and
 // ignored blocks, and all marked code, can be browsed too.
 
-const IGNORE_REASONS = [
-  { reason: 'example-output', label: 'Example output', hint: 'Sample output shown to the reader' },
-  { reason: 'manual-command', label: 'Manual command', hint: 'A command too simple or doc-specific to track' },
-  { reason: 'no-repo-source', label: 'No repo source', hint: 'Content with no counterpart in this repo' },
-];
-
 let data = null;
 let selectedKey = null;   // `${asm}:${ref}`
 let tab = 'todo';         // 'todo' | 'resolved' | 'ignored' | 'code'
 let query = '';
 let selectedCandidate = -1;   // index of the open recommendation, -1 when all are collapsed
+let ignoreChoice = null;  // the reason picked to ignore the block as (NEW_REASON for a new one), and the new one's fields
+const NEW_REASON = '';
 let rendered = [];        // pierre components to clean up
 
 const root = document.getElementById('root');
@@ -95,8 +91,15 @@ function codeName(c) {
   return c.snippet ? `${c.file} › § ${c.snippet}` : `${c.file} (whole file)`;
 }
 
+// A reason's directory name, as words: example-output → Example output
 function reasonLabel(reason) {
-  return IGNORE_REASONS.find(r => r.reason === reason)?.label || reason;
+  const words = String(reason).replace(/-/g, ' ');
+  return words.charAt(0).toUpperCase() + words.slice(1);
+}
+
+// A name typed for a new reason, as a directory name: Example output → example-output
+function reasonName(typed) {
+  return typed.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
 }
 
 // How a resolved block is resolved, in a few words
@@ -261,7 +264,8 @@ async function rescan() {
   const listState = () => JSON.stringify([allBlocks().map(keyOf), resolvedBlocks().map(b => [keyOf(b), howResolved(b)]), ignoredBlocks().map(b => [keyOf(b), b.ignoredAs]), data.staleIgnored, data.code.map(c => [c.id, c.matchedBy.length]), data.problems]);
   const before = visibleBlocks();
   const idx = before.findIndex(b => keyOf(b) === selectedKey);
-  const shownBefore = JSON.stringify(selectedBlock());
+  const shown = () => JSON.stringify([selectedBlock(), data.ignoreReasons]);
+  const shownBefore = shown();
   const queueBefore = listState();
   await load();
   const blocks = visibleBlocks();
@@ -275,7 +279,7 @@ async function rescan() {
   if (!selectedKey && blocks[0]) selectedKey = keyOf(blocks[0]);
   // Leave what's on screen alone (scroll positions included) unless it changed
   if (listState() !== queueBefore) renderQueue();
-  if (JSON.stringify(selectedBlock()) !== shownBefore) {
+  if (shown() !== shownBefore) {
     const scrollTop = blockEl.scrollTop;
     renderBlock();
     blockEl.scrollTop = scrollTop;
@@ -311,7 +315,7 @@ function renderQueue() {
   for (const g of data.guides) {
     const blocks = { todo: g.blocks, resolved: g.resolved, ignored: g.ignored }[tab].filter(matchesQuery);
     if (!blocks.length) continue;
-    list.appendChild(el('div', 'guide', `<span>${esc(g.title)}</span><span class="count">${blocks.length}</span>`));
+    list.appendChild(el('div', 'guide', `<span>${esc(guideLabel(g))}</span><span class="count">${blocks.length}</span>`));
     for (const b of blocks) {
       shown++;
       const item = el('button', 'item' + (keyOf(b) === selectedKey ? ' selected' : ''));
@@ -380,6 +384,7 @@ function renderCodeList(list) {
 function select(key) {
   selectedKey = key;
   selectedCandidate = -1;
+  ignoreChoice = null;
   history.replaceState(null, '', key ? `#${encodeURIComponent(key)}` : location.pathname);
   renderQueue();
   renderBlock();
@@ -388,10 +393,16 @@ function select(key) {
 
 // --- Block ---
 
+// An assembly's title, after its docs source's name when there are several
+function guideLabel(g) {
+  return g.docsName ? `${g.docsName} › ${g.title}` : g.title;
+}
+
 function aiPrompt(b) {
+  const guide = data.guides.find(g => g.id === b.asm);
   return `In this repo, make marked code match this docs code block. Run \`asadoc guide\` first to learn how markers work.
 
-  ${b.ref}: modules/${b.module}.adoc, line ${b.line}, in the docs at ${data.docsLocation}
+  ${b.ref}: modules/${b.module}.adoc, line ${b.line}, in the docs at ${guide.docsLocation}
 
 Don't edit the docs.
 Check with \`asadoc check ${b.ref}\`: it says why the block isn't resolved, with a diff. You're done when it reports ✓ resolved; show that output.
@@ -404,11 +415,22 @@ function findRenderedBlock(container, b) {
   return code?.closest('.listingblock') || null;
 }
 
-async function copyPrompt(b, button) {
+async function copyPrompt(b) {
   await navigator.clipboard.writeText(aiPrompt(b));
-  const text = button.textContent;
-  button.textContent = 'Copied';
-  setTimeout(() => { button.textContent = text; }, 1500);
+  toast('AI prompt copied to clipboard', 'ok');
+}
+
+// Copies the prompt from an inline mention, pointing out the header's Copy AI
+// prompt button so it's found next time
+async function copyPromptFromMention(b) {
+  await copyPrompt(b);
+  const button = blockEl.querySelector('.copy-prompt');
+  if (!button) return;
+  button.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+  button.classList.remove('highlight');
+  void button.offsetWidth; // restart the animation on repeat clicks
+  button.classList.add('highlight');
+  button.addEventListener('animationend', () => button.classList.remove('highlight'), { once: true });
 }
 
 // An option as written on a marker
@@ -501,7 +523,7 @@ function candidateBody(b, o) {
     const note = el('div', 'miss-note');
     note.innerHTML = 'Not identical. Edit it until it reads exactly like the doc (for values the repo leaves open, like <code>&lt;NODES_MTU&gt;</code>, add <code>| param: "&lt;NODES_MTU&gt;"</code> to its marker: <a href="/guide" target="_blank">see how</a>), or ';
     const copy = el('button', 'link inline', 'copy a prompt for your AI assistant');
-    copy.addEventListener('click', () => copyPrompt(b, copy));
+    copy.addEventListener('click', () => copyPromptFromMention(b));
     note.appendChild(copy);
     note.appendChild(document.createTextNode('.'));
     body.appendChild(note);
@@ -519,13 +541,13 @@ function candidateBody(b, o) {
 function blockHeader(b, guide, withPrompt) {
   const head = el('header', 'block-head');
   head.innerHTML = `
-    <div class="crumbs">${esc(guide.title)}${b.section ? ` › ${esc(b.section)}` : ''}</div>
+    <div class="crumbs">${esc(guideLabel(guide))}${b.section ? ` › ${esc(b.section)}` : ''}</div>
     <div class="head-row">
       <span class="ref">${esc(b.ref)}</span>
-      ${data.links.docs ? `<a href="${data.links.docs}modules/${b.module}.adoc?plain=1#L${b.line}" target="_blank">Doc source ↗</a>` : ''}
+      ${guide.docsLink ? `<a href="${guide.docsLink}modules/${b.module}.adoc?plain=1#L${b.line}" target="_blank">Doc source ↗</a>` : ''}
       ${withPrompt ? '<button class="secondary copy-prompt" title="A prompt for your AI assistant to link this block">Copy AI prompt</button>' : ''}
     </div>`;
-  head.querySelector('.copy-prompt')?.addEventListener('click', (e) => copyPrompt(b, e.target));
+  head.querySelector('.copy-prompt')?.addEventListener('click', () => copyPrompt(b));
   return head;
 }
 
@@ -619,13 +641,13 @@ function renderMarkedCode(c) {
     <div class="crumbs">Marked code</div>
     <div class="head-row">
       <span class="ref">${esc(c.file)}</span>${where}
-      ${data.links.repo ? `<a href="${data.links.repo}${c.file}${c.lines ? `#L${c.lines[0]}-L${c.lines[1]}` : ''}" target="_blank">Source ↗</a>` : ''}
+      ${c.link ? `<a href="${c.link}${c.lines ? `#L${c.lines[0]}-L${c.lines[1]}` : ''}" target="_blank">Source ↗</a>` : ''}
     </div>`));
 
   const sec = el('section', 'resolved');
   const blockLink = (asm, ref, extra = '') => {
     const guide = data.guides.find(g => g.id === asm);
-    const btn = el('button', 'block-link', `<code>${esc(ref)}</code><span class="muted">${esc(guide?.title || asm)}</span>${extra}`);
+    const btn = el('button', 'block-link', `<code>${esc(ref)}</code><span class="muted">${esc(guide ? guideLabel(guide) : asm)}</span>${extra}`);
     btn.addEventListener('click', () => goToBlock(asm, ref));
     return btn;
   };
@@ -697,7 +719,14 @@ function renderBlock() {
   const assoc = el('section', 'associate');
   assoc.appendChild(el('h2', null, 'Make repo code match'));
   if (!b.candidates.length) {
-    assoc.appendChild(el('p', 'muted', 'Nothing in the repo looks like this block. Mark the code it comes from (or have your AI assistant do it).'));
+    const none = el('p', 'muted', data.code.length
+      ? 'No currently marked code resembles this block. Mark the code it comes from ('
+      : 'No code is marked yet. Mark the code this block comes from (');
+    const copy = el('button', 'link inline', 'or have your AI assistant do it');
+    copy.title = 'Copy a prompt for your AI assistant to link this block';
+    copy.addEventListener('click', () => copyPromptFromMention(b));
+    none.append(copy, ').');
+    assoc.appendChild(none);
   }
   b.candidates.forEach((o, i) => {
     const open = i === selectedCandidate;
@@ -714,18 +743,77 @@ function renderBlock() {
   });
   blockEl.appendChild(assoc);
 
-  // Ignore
+  blockEl.appendChild(ignoreSection(b));
+}
+
+// Ignoring the block: pick a reason (or describe a new one), then apply it
+function ignoreSection(b) {
+  ignoreChoice ??= { reason: data.ignoreReasons.length ? null : NEW_REASON, name: '', description: '' };
   const ign = el('section', 'ignore');
-  ign.appendChild(el('h2', null, 'Or ignore it, as:'));
-  const row = el('div', 'ignore-row');
-  for (const r of IGNORE_REASONS) {
-    const btn = el('button', 'secondary', esc(r.label));
-    btn.title = r.hint;
-    btn.addEventListener('click', () => act('/api/ignore', { asm: b.asm, ref: b.ref, reason: r.reason }, btn));
-    row.appendChild(btn);
+  ign.appendChild(el('h2', null, 'Or ignore it'));
+  const form = el('form', 'ignore-form');
+  const option = (reason, title, description) => {
+    const label = el('label', 'ignore-option' + (ignoreChoice.reason === reason ? ' checked' : ''));
+    const radio = el('input');
+    radio.type = 'radio';
+    radio.name = 'reason';
+    radio.checked = ignoreChoice.reason === reason;
+    radio.addEventListener('change', () => { ignoreChoice.reason = reason; renderIgnoreForm(); });
+    label.appendChild(radio);
+    const text = el('span', 'ignore-text', `<b>${title}</b>`);
+    text.appendChild(el('span', 'ignore-desc', description));
+    label.appendChild(text);
+    return label;
+  };
+  for (const r of data.ignoreReasons) {
+    form.appendChild(option(r.name, esc(reasonLabel(r.name)), r.description
+      ? esc(r.description)
+      : `<span class="muted">No description: add one to <code>.asadoc/ignore/${esc(r.name)}/README.md</code></span>`));
   }
-  ign.appendChild(row);
-  blockEl.appendChild(ign);
+  const fresh = option(NEW_REASON, 'New reason…', '<span class="muted">Name a reason that isn’t listed, and say what it means</span>');
+  form.appendChild(fresh);
+  const fields = el('div', 'new-reason');
+  const name = el('input');
+  name.placeholder = 'Name, e.g. Example output';
+  name.value = ignoreChoice.name;
+  const where = el('div', 'muted small');
+  const description = el('textarea');
+  description.rows = 2;
+  description.placeholder = 'What it means, e.g. Sample output shown to the reader, not produced by this repo';
+  description.value = ignoreChoice.description;
+  fields.append(name, where, description);
+  fresh.querySelector('.ignore-text').appendChild(fields);
+  const apply = el('button', 'primary');
+  apply.type = 'submit';
+  form.appendChild(apply);
+  ign.appendChild(form);
+
+  // Only the parts that depend on the choice, so typing keeps focus
+  function renderIgnoreForm() {
+    const isNew = ignoreChoice.reason === NEW_REASON;
+    const slug = reasonName(ignoreChoice.name);
+    const taken = data.ignoreReasons.some(r => r.name === slug);
+    for (const label of form.querySelectorAll('.ignore-option')) label.classList.toggle('checked', label.querySelector('input').checked);
+    fields.hidden = !isNew;
+    where.innerHTML = !slug ? '&nbsp;'
+      : taken ? `<span class="error">${esc(reasonLabel(slug))} already exists: pick it above</span>`
+      : `Saved in <code>.asadoc/ignore/${esc(slug)}/</code>`;
+    const ready = isNew ? slug && !taken && ignoreChoice.description.trim() : ignoreChoice.reason != null;
+    apply.disabled = !ready;
+    apply.textContent = !ready ? 'Ignore' : `Ignore as ${reasonLabel(isNew ? slug : ignoreChoice.reason)}`;
+  }
+  name.addEventListener('input', () => { ignoreChoice.name = name.value; renderIgnoreForm(); });
+  description.addEventListener('input', () => { ignoreChoice.description = description.value; renderIgnoreForm(); });
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    if (apply.disabled) return;
+    const body = ignoreChoice.reason === NEW_REASON
+      ? { asm: b.asm, ref: b.ref, reason: reasonName(ignoreChoice.name), newReason: ignoreChoice.description.trim() }
+      : { asm: b.asm, ref: b.ref, reason: ignoreChoice.reason };
+    act('/api/ignore', body, apply);
+  });
+  renderIgnoreForm();
+  return ign;
 }
 
 // --- Keyboard: j/k move through the queue, 1-9 open a candidate ---

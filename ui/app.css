@@ -90,6 +90,7 @@ a:hover { text-decoration: underline; }
 .secondary { background: var(--raised); }
 .secondary:hover { border-color: var(--muted); }
 .secondary.was { border-color: var(--yellow); }
+.primary:disabled { opacity: 0.5; cursor: default; filter: none; }
 .busy { opacity: 0.5; pointer-events: none; }
 
 /* --- Block --- */
@@ -101,6 +102,10 @@ a:hover { text-decoration: underline; }
 .head-row { display: flex; align-items: center; gap: 16px; margin-top: 2px; }
 .head-row .ref { font-weight: 600; font-size: 1rem; }
 .head-row .copy-prompt { margin-left: auto; }
+.copy-prompt.highlight { animation: point-out 0.6s ease-in-out 3; }
+@keyframes point-out {
+  50% { border-color: var(--accent); box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent) 35%, transparent); }
+}
 .lead { margin-bottom: 8px; }
 .doc-code { border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
 
@@ -173,7 +178,21 @@ h2 { font-size: 0.95rem; margin: 28px 0 10px; }
 .fallback { padding: 12px; white-space: pre-wrap; }
 
 /* --- Ignore --- */
-.ignore-row { display: flex; gap: 8px; flex-wrap: wrap; }
+.ignore-form { display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.ignore-option {
+  display: flex; gap: 10px; align-items: flex-start; width: 100%; padding: 8px 12px; cursor: pointer;
+  border: 1px solid var(--border); border-radius: 6px;
+}
+.ignore-option.checked { border-color: var(--accent); }
+.ignore-option input[type=radio] { margin-top: 3px; }
+.ignore-text { display: flex; flex-direction: column; gap: 2px; flex: 1; font-size: 0.9rem; }
+.ignore-desc { white-space: pre-line; }
+.new-reason { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; }
+.new-reason[hidden] { display: none; }
+.new-reason input, .new-reason textarea { font: inherit; padding: 4px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--bg, inherit); color: inherit; }
+.new-reason .small { font-size: 0.78rem; }
+.new-reason .error { color: var(--red); }
+.ignore-form > button { margin-top: 4px; }
 
 /* --- Toast --- */
 .toast {

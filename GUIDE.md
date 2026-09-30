@@ -1,7 +1,7 @@
 # How asadoc works
 
 asadoc checks that every code block in a set of AsciiDoc docs comes from code
-in this repo. The docs are never edited: when the two disagree, the repo side
+in this repo (or in the other repos it names). The docs are never edited: when the two disagree, the repo side
 changes (its code, or the markers on it), or the doc block gets ignored.
 
 ## Doc blocks
@@ -11,7 +11,9 @@ Every `[source,…]` block in the modules included by the assemblies listed in
 ending with a newline. Tools refer to a block as `<module>/<lang>-<NNN>`, e.g.
 `nw-dpf-creating-bfb/yaml-001` is the first YAML block in
 `modules/nw-dpf-creating-bfb.adoc`. That name is only the block's current
-position; nothing stores it.
+position; nothing stores it. With several docs sources, it starts with the
+source's name: `openshift:nw-dpf-creating-bfb/yaml-001` (commands also take it
+without the name when only one source has such a block).
 
 ## Marked code
 
@@ -98,15 +100,22 @@ read, or an option that doesn't fit the code, is reported as a marker problem.
 
 Doc blocks that don't come from the repo are ignored by putting their exact
 content in a file under `.asadoc/ignore/` (next to `config.toml`; `ignore_dir`
-changes it), in a subdirectory for the reason:
+changes it), in a subdirectory for the reason. These reasons are always
+offered:
 
 - `example-output/`: sample output shown to the reader
 - `manual-command/`: a command too simple or doc-specific to track
 - `no-repo-source/`: content with no counterpart in the repo
 
+Any other subdirectory is a reason too, and its `README.md` says what it means
+(one in a preset's directory replaces its description). The review UI shows the
+descriptions, and can add new reasons:
+
 ```text
 .asadoc/ignore/
+  example-output/README.md    # Sample output shown to the reader
   example-output/nw-dpf-worker-machineconfig--terminal-005.txt
+  manual-command/README.md    # A command too simple or doc-specific to track
   manual-command/nw-dpf-management-cluster-setup--terminal-002.txt
 ```
 
@@ -153,9 +162,11 @@ makes it.
 ## .asadoc/config.toml
 
 ```toml
-[docs.asciidoc]            # the docs' format (only AsciiDoc, for now)
+[[docs]]
 git = "https://github.com/openshift/openshift-docs"
 ref = "main"               # branch, tag or commit; a commit pins the check
+
+[docs.asciidoc]            # the docs' format (only AsciiDoc, for now)
 assemblies = [             # whose modules' code blocks must come from this repo
   "networking/dpf/dpf-operator-installation.adoc",
 ]
@@ -170,8 +181,56 @@ asadoc fetches just `ref` of the docs repo, and only the files it reads, into
 `~/.cache/asadoc/`. Instead of `git` and `ref`, `path = "../../openshift-docs"` reads
 a local checkout as it is on disk (and `asadoc serve` then follows its changes);
 `--docs <dir>` does the same for one run, e.g. to try unmerged docs changes.
-Links to the docs default to the fetched commit on GitHub (`links.docs`
-overrides them).
+Links to the docs default to the fetched commit on GitHub (`link = "<base URL>"`
+next to `git` overrides them).
+
+For docs in several repos (or one repo at several refs), add a `[[docs]]` for
+each, with a `name`; the `[docs.asciidoc]` after a `[[docs]]` belongs to it:
+
+```toml
+[[docs]]
+name = "openshift"
+git = "https://github.com/openshift/openshift-docs"
+ref = "main"
+[docs.asciidoc]
+assemblies = ["networking/dpf/dpf-operator-installation.adoc"]
+
+[[docs]]
+name = "rhoso"
+path = "../../rhoso-docs"
+[docs.asciidoc]
+assemblies = ["dpu/deploying.adoc"]
+```
+
+Marked code needs to match a block in any of them, and one ignore directory
+serves them all. `--docs <name>=<dir>` replaces one of them for a run.
+
+### Code in several repos
+
+When the docs' code comes from several repos, list the others as `[[code]]`,
+each with a `name`, and `git` and `ref` or a local `path` (plus `link`, the
+base URL for its "source" links, which defaults to the fetched commit on GitHub):
+
+```toml
+[[code]]
+name = "installer"
+git = "https://github.com/org/installer"
+ref = "main"
+```
+
+A block is resolved when marked code in any of the repos matches it, and
+ignored when any of their ignore directories has its content (each repo's own
+`.asadoc/config.toml` says where its directory is, if it moved it). Their files are
+named `<name>:<path>`, e.g. `asadoc check installer:deploy/bfb.yaml`. asadoc
+only changes this repo, and `path` checkouts: `asadoc fix` and the review UI
+don't offer to change code read from git, and blocks another repo ignores
+are un-ignored there.
+
+Unmatched marked code, stale ignored content and marker problems are reported
+for this repo only: the other repos may check other docs. Each repo that runs
+asadoc in its CI can have a config of its own, with the others as `[[code]]`.
+`--code <name>=<dir>` replaces one of them for a run, e.g. to try unmerged
+changes.
 
 ## Commands
 

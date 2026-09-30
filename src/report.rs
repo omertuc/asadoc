@@ -5,7 +5,7 @@ use std::collections::HashSet;
 
 use similar::{ChangeTag, TextDiff};
 
-use crate::config::AsadocConfig;
+use crate::config::{AsadocConfig, CodeSource, Docs};
 use crate::eval::{self, AssemblyEval, BlockEval, CandidateInfo, CodeMatch, Evaluation};
 use crate::lightbulb;
 use crate::matching::PlaceholderValues;
@@ -82,6 +82,7 @@ pub(crate) struct UnresolvedBlock {
 #[derive(Debug)]
 pub(crate) struct UnresolvedInAssembly {
     pub title: String,
+    /// Relative to the docs root (after `<docs name>:` when there are several docs sources)
     pub path: String,
     pub blocks: Vec<UnresolvedBlock>,
 }
@@ -97,7 +98,10 @@ pub(crate) struct UnusedCode {
 /// Everything `asadoc check` reports
 #[derive(Debug)]
 pub(crate) struct CheckSummary {
-    pub docs_description: String,
+    /// Each docs source, for people
+    pub docs_descriptions: Vec<String>,
+    /// Each code source besides this repo, for people
+    pub other_code_descriptions: Vec<String>,
     pub total_blocks: usize,
     pub resolved_blocks: usize,
     pub ignored_blocks: usize,
@@ -199,7 +203,7 @@ impl CheckSummary {
         let unresolved = evaluation
             .assemblies
             .iter()
-            .filter_map(unresolved_in_assembly)
+            .filter_map(|assembly_eval| unresolved_in_assembly(asadoc_config, assembly_eval))
             .collect();
         let shown_code_ids = shown_code_ids(evaluation);
         let unused_code = evaluation
@@ -211,7 +215,8 @@ impl CheckSummary {
             .context("describing marked code no doc block matches")?;
 
         Ok(Self {
-            docs_description: asadoc_config.docs.describe(),
+            docs_descriptions: asadoc_config.docs.iter().map(Docs::describe).collect(),
+            other_code_descriptions: asadoc_config.code.iter().skip(1).map(CodeSource::describe).collect(),
             total_blocks: evaluation
                 .assemblies
                 .iter()
@@ -240,7 +245,7 @@ impl CheckSummary {
 }
 
 /// The blocks of an assembly still to resolve; None when there are none
-fn unresolved_in_assembly(assembly_eval: &AssemblyEval) -> Option<UnresolvedInAssembly> {
+fn unresolved_in_assembly(asadoc_config: &AsadocConfig, assembly_eval: &AssemblyEval) -> Option<UnresolvedInAssembly> {
     let unresolved_blocks: Vec<UnresolvedBlock> = assembly_eval
         .blocks
         .iter()
@@ -257,7 +262,10 @@ fn unresolved_in_assembly(assembly_eval: &AssemblyEval) -> Option<UnresolvedInAs
         .collect();
     (!unresolved_blocks.is_empty()).then(|| UnresolvedInAssembly {
         title: assembly_eval.assembly.title.clone(),
-        path: assembly_eval.assembly.path.clone(),
+        path: asadoc_config.docs.get(assembly_eval.assembly.docs_index).map_or_else(
+            || assembly_eval.assembly.path.clone(),
+            |docs| docs.qualify(&assembly_eval.assembly.path),
+        ),
         blocks: unresolved_blocks,
     })
 }
@@ -320,7 +328,7 @@ pub(crate) enum CheckOutcome {
         fix_steps: Option<Vec<String>>,
         sides: Sides,
     },
-    /// Nothing in the repo resembles the block
+    /// No marked code resembles the block
     NothingResembles {
         reference: String,
         location: String,
@@ -415,10 +423,7 @@ fn find_against_code<'a>(evaluation: &'a Evaluation, code_arg: &str) -> Result<&
 
 /// What checking the block, or all the marked code, a name refers to found
 fn name_outcomes(evaluation: &Evaluation, name: &str, against_code: Option<&MarkedCode>) -> Result<Vec<CheckOutcome>> {
-    if let Some((_, block_eval)) = evaluation
-        .blocks()
-        .find(|(_, block_eval)| block_eval.block.reference == name)
-    {
+    if let Some(block_eval) = evaluation.find_named(name)? {
         let outcome = match against_code {
             Some(marked_code) => block_outcome_against(evaluation, block_eval, marked_code)
                 .with_context(|| format!("checking {name} against {}", describe_code(marked_code)))?,
@@ -567,12 +572,12 @@ impl FixOutcome {
 }
 
 /// Makes the change `asadoc check` lists under a block
-pub(crate) fn fix(config: &AsadocConfig, reference: &str) -> Result<FixOutcome> {
+pub(crate) fn fix(config: &AsadocConfig, name: &str) -> Result<FixOutcome> {
     let evaluation = eval::evaluate(config, true).context("evaluating the doc blocks")?;
-    let (_, block_eval) = evaluation
-        .blocks()
-        .find(|(_, block_eval)| block_eval.block.reference == reference)
-        .with_context(|| format!("no doc block {reference} in the configured assemblies"))?;
+    let block_eval = evaluation
+        .find_named(name)?
+        .with_context(|| format!("no doc block {name} in the configured assemblies"))?;
+    let reference = block_eval.block.reference.as_str();
     if block_eval.done() {
         return Ok(FixOutcome::AlreadyDone);
     }
@@ -583,13 +588,9 @@ pub(crate) fn fix(config: &AsadocConfig, reference: &str) -> Result<FixOutcome> 
     else {
         return Ok(FixOutcome::NoFix);
     };
-    lightbulb::apply(
-        &config.repo_root,
-        &candidate.file,
-        candidate.section_name.as_deref(),
-        plan,
-    )
-    .with_context(|| format!("changing {}", candidate.file))?;
+    let file_path = config.writable_code_file(&candidate.file)?;
+    lightbulb::apply(&file_path, candidate.section_name.as_deref(), plan)
+        .with_context(|| format!("changing {}", candidate.file))?;
     let reevaluation = eval::evaluate(config, false).context("checking the block again")?;
     Ok(FixOutcome::Applied {
         changed_file: candidate.file.clone(),

@@ -1,18 +1,19 @@
-//! Evaluation: every doc block against all marked code and the ignore directory.
+//! Evaluation: every doc block against all marked code and the ignore
+//! directories, of every code source.
 //!
 //! A block is resolved when some marked code (its options applied, its doc
 //! options applied to the block, its placeholders free) matches it; ignored
-//! when its content is in the ignore directory; and otherwise still to resolve,
+//! when its content is in an ignore directory; and otherwise still to resolve,
 //! with the repo code most like it as candidates.
 
-use crate::config::AsadocConfig;
+use crate::config::{AsadocConfig, Docs};
 use crate::docs::{self, Assembly, DocBlock};
-use crate::ignored::IgnoredBlocks;
+use crate::ignored::{IgnoreReason, IgnoredBlocks};
 use crate::lightbulb::{self, Candidate, LightbulbFix, LightbulbPlan};
 use crate::markers::{self, MarkerOption};
 use crate::matching::PlaceholderValues;
 use crate::repo::{self, MarkedCode, RepoFile, RepoScan};
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::iter;
@@ -87,6 +88,8 @@ pub(crate) struct Evaluation {
     pub scan: RepoScan,
     /// Ignored entries no doc block has anymore: (reason, content)
     pub stale_ignored: Vec<(String, String)>,
+    /// The reasons blocks can be ignored for
+    pub ignore_reasons: Vec<IgnoreReason>,
     /// Marked code no doc block matches (indexes into `scan.marked`)
     pub unused_marked_indexes: Vec<usize>,
 }
@@ -99,6 +102,36 @@ impl Evaluation {
                 .iter()
                 .map(move |block_eval| (assembly_eval, block_eval))
         })
+    }
+    /// The block a command-line name refers to: its reference, or, when it's
+    /// unambiguous, its reference without the docs name (`<module>/<language>-<NNN>`)
+    pub(crate) fn find_named(&self, name: &str) -> Result<Option<&BlockEval>> {
+        if let Some((_, block_eval)) = self.blocks().find(|(_, block_eval)| block_eval.block.reference == name) {
+            return Ok(Some(block_eval));
+        }
+        let mut references: Vec<&str> = self
+            .blocks()
+            .map(|(_, block_eval)| block_eval.block.reference.as_str())
+            .filter(|reference| {
+                reference
+                    .split_once(':')
+                    .is_some_and(|(_, unqualified)| unqualified == name)
+            })
+            .collect();
+        // A module in several assemblies is there once for each
+        references.sort_unstable();
+        references.dedup();
+        match references.as_slice() {
+            [] => Ok(None),
+            [reference] => Ok(self
+                .blocks()
+                .find(|(_, block_eval)| block_eval.block.reference == *reference)
+                .map(|(_, block_eval)| block_eval)),
+            _ => bail!(
+                "{name} is in several docs sources; name one of {}",
+                references.join(", ")
+            ),
+        }
     }
     pub(crate) fn find(&self, assembly_id: &str, reference: &str) -> Option<&BlockEval> {
         self.blocks()
@@ -269,7 +302,7 @@ fn doc_side(block: &DocBlock, doc_options: &[MarkerOption]) -> Option<String> {
 
 pub(crate) fn evaluate(config: &AsadocConfig, with_candidates: bool) -> Result<Evaluation> {
     let scan = repo::scan(config).context("scanning the repo for marked code")?;
-    let ignored_blocks = IgnoredBlocks::load(&config.ignore_dir).context("loading the ignore directory")?;
+    let ignored_blocks = IgnoredBlocks::load_all(config).context("loading the ignore directories")?;
 
     let mut assemblies = read_assemblies(config)?
         .into_iter()
@@ -284,29 +317,45 @@ pub(crate) fn evaluate(config: &AsadocConfig, with_candidates: bool) -> Result<E
     let unused_marked_indexes = unused_code(&assemblies, &scan);
 
     if with_candidates {
-        add_candidates(&mut assemblies, &scan, &stale_ignored).context("finding code like the blocks to resolve")?;
+        add_candidates(config, &mut assemblies, &scan, &stale_ignored)
+            .context("finding code like the blocks to resolve")?;
     }
 
     Ok(Evaluation {
         assemblies,
         scan,
         stale_ignored,
+        ignore_reasons: ignored_blocks.reasons,
         unused_marked_indexes,
     })
 }
 
-/// The configured assemblies, with every file evaluating them reads
-/// prefetched: in two fetches when the docs come from git
+/// The configured assemblies of every docs source, in order
 fn read_assemblies(config: &AsadocConfig) -> Result<Vec<Assembly>> {
-    config
+    Ok(config
         .docs
-        .prefetch(&config.assemblies)
+        .iter()
+        .enumerate()
+        .map(|(docs_index, docs)| {
+            read_docs_assemblies(docs, docs_index).with_context(|| format!("reading the docs {}", docs.describe()))
+        })
+        .collect::<Result<Vec<_>>>()?
+        .into_iter()
+        .flatten()
+        .collect())
+}
+
+/// A docs source's assemblies, with every file evaluating them reads
+/// prefetched: in two fetches when the docs come from git
+fn read_docs_assemblies(docs: &Docs, docs_index: usize) -> Result<Vec<Assembly>> {
+    docs.source
+        .prefetch(&docs.assemblies)
         .context("prefetching the assemblies")?;
-    let assemblies = config
+    let assemblies = docs
         .assemblies
         .iter()
         .map(|assembly_path| {
-            docs::read_assembly(&config.docs, assembly_path)
+            docs::read_assembly(docs, docs_index, assembly_path)
                 .with_context(|| format!("reading the assembly {assembly_path}"))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -314,7 +363,7 @@ fn read_assemblies(config: &AsadocConfig) -> Result<Vec<Assembly>> {
         .iter()
         .flat_map(|assembly| assembly.modules.iter().map(|module| docs::module_path(module)))
         .collect::<Vec<_>>();
-    config.docs.prefetch(&module_paths).context("prefetching the modules")?;
+    docs.source.prefetch(&module_paths).context("prefetching the modules")?;
     Ok(assemblies)
 }
 
@@ -324,10 +373,14 @@ fn evaluate_assembly(
     scan: &RepoScan,
     ignored_blocks: &IgnoredBlocks,
 ) -> Result<AssemblyEval> {
+    let docs = config
+        .docs
+        .get(assembly.docs_index)
+        .with_context(|| format!("no docs source for {}", assembly.id))?;
     let block_evals = assembly
         .modules
         .iter()
-        .map(|module| evaluate_module(config, module, scan, ignored_blocks))
+        .map(|module| evaluate_module(docs, module, scan, ignored_blocks))
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .flatten()
@@ -339,12 +392,12 @@ fn evaluate_assembly(
 }
 
 fn evaluate_module(
-    config: &AsadocConfig,
+    docs: &Docs,
     module: &str,
     scan: &RepoScan,
     ignored_blocks: &IgnoredBlocks,
 ) -> Result<Vec<BlockEval>> {
-    docs::extract_blocks(&config.docs, module)
+    docs::extract_blocks(docs, module)
         .with_context(|| format!("reading the module {module}"))?
         .into_iter()
         .map(|block| evaluate_block(block, scan, ignored_blocks))
@@ -388,7 +441,8 @@ fn match_block(block: &DocBlock, marked: &[MarkedCode]) -> Result<Vec<CodeMatch>
         .collect()
 }
 
-/// Ignored entries no doc block has anymore: (reason, content)
+/// Ignored entries of this repo no doc block has anymore: (reason, content).
+/// Other code sources may ignore content for docs this config doesn't check
 fn stale_ignored(assemblies: &[AssemblyEval], ignored_blocks: &IgnoredBlocks) -> Vec<(String, String)> {
     let ignored_contents_in_use: HashSet<&str> = assemblies
         .iter()
@@ -399,12 +453,16 @@ fn stale_ignored(assemblies: &[AssemblyEval], ignored_blocks: &IgnoredBlocks) ->
     ignored_blocks
         .entries
         .iter()
-        .filter(|ignored_entry| !ignored_contents_in_use.contains(ignored_entry.content.as_str()))
+        .filter(|ignored_entry| {
+            ignored_entry.source.is_none() && !ignored_contents_in_use.contains(ignored_entry.content.as_str())
+        })
         .map(|ignored_entry| (ignored_entry.reason.clone(), ignored_entry.content.clone()))
         .collect()
 }
 
-/// Marked code no doc block matches (indexes into `scan.marked`)
+/// Marked code in this repo no doc block matches (indexes into
+/// `scan.marked`). Other code sources may mark code for docs this config
+/// doesn't check
 fn unused_code(assemblies: &[AssemblyEval], scan: &RepoScan) -> Vec<usize> {
     let matched_indexes: HashSet<usize> = assemblies
         .iter()
@@ -412,15 +470,23 @@ fn unused_code(assemblies: &[AssemblyEval], scan: &RepoScan) -> Vec<usize> {
         .flat_map(|block_eval| &block_eval.matches)
         .map(|code_match| code_match.marked_index)
         .collect();
-    (0..scan.marked.len())
-        .filter(|marked_index| !matched_indexes.contains(marked_index))
+    scan.marked
+        .iter()
+        .enumerate()
+        .filter(|(marked_index, code)| code.source_index == 0 && !matched_indexes.contains(marked_index))
+        .map(|(marked_index, _)| marked_index)
         .collect()
 }
 
 /// For each block still to resolve: the code most like it, and the stale
 /// ignored content it probably used to be
-fn add_candidates(assemblies: &mut [AssemblyEval], scan: &RepoScan, stale_ignored: &[(String, String)]) -> Result<()> {
-    let pool_entries = candidate_pool(scan).context("tokenizing the repo code")?;
+fn add_candidates(
+    config: &AsadocConfig,
+    assemblies: &mut [AssemblyEval],
+    scan: &RepoScan,
+    stale_ignored: &[(String, String)],
+) -> Result<()> {
+    let pool_entries = candidate_pool(config, scan).context("tokenizing the repo code")?;
     assemblies
         .iter_mut()
         .flat_map(|assembly_eval| &mut assembly_eval.blocks)
@@ -463,10 +529,12 @@ struct CandidatePoolEntry<'a> {
     id: String,
     candidate: Candidate<'a>,
     tokens: Vec<String>,
+    /// Whether its file is on disk, so a lightbulb can change it
+    is_writable: bool,
 }
 
 /// All marked code (in a scanned file), then every unmarked file
-fn candidate_pool(scan: &RepoScan) -> Result<Vec<CandidatePoolEntry<'_>>> {
+fn candidate_pool<'a>(config: &AsadocConfig, scan: &'a RepoScan) -> Result<Vec<CandidatePoolEntry<'a>>> {
     let files_by_path: HashMap<&str, &RepoFile> = scan
         .files
         .iter()
@@ -475,17 +543,29 @@ fn candidate_pool(scan: &RepoScan) -> Result<Vec<CandidatePoolEntry<'_>>> {
     let marked_entries = scan
         .marked
         .iter()
-        .filter_map(|code| Some(marked_pool_entry(code, files_by_path.get(code.file.as_str())?)));
+        .filter_map(|code| Some(marked_pool_entry(config, code, files_by_path.get(code.file.as_str())?)));
     let unmarked_entries = scan
         .files
         .iter()
         .filter(|repo_file| repo_file.markers.file.is_none())
-        .map(unmarked_pool_entry);
+        .map(|repo_file| unmarked_pool_entry(config, repo_file));
     marked_entries.chain(unmarked_entries).collect()
 }
 
-fn marked_pool_entry<'a>(code: &'a MarkedCode, repo_file: &'a RepoFile) -> Result<CandidatePoolEntry<'a>> {
+fn is_writable_source(config: &AsadocConfig, source_index: usize) -> bool {
+    config
+        .code
+        .get(source_index)
+        .is_some_and(|code_source| code_source.tree.local_root().is_some())
+}
+
+fn marked_pool_entry<'a>(
+    config: &AsadocConfig,
+    code: &'a MarkedCode,
+    repo_file: &'a RepoFile,
+) -> Result<CandidatePoolEntry<'a>> {
     Ok(CandidatePoolEntry {
+        is_writable: is_writable_source(config, code.source_index),
         id: code.id.clone(),
         tokens: tokens(&code.content).with_context(|| format!("tokenizing {}", code.id))?,
         candidate: Candidate {
@@ -498,8 +578,9 @@ fn marked_pool_entry<'a>(code: &'a MarkedCode, repo_file: &'a RepoFile) -> Resul
     })
 }
 
-fn unmarked_pool_entry(repo_file: &RepoFile) -> Result<CandidatePoolEntry<'_>> {
+fn unmarked_pool_entry<'a>(config: &AsadocConfig, repo_file: &'a RepoFile) -> Result<CandidatePoolEntry<'a>> {
     Ok(CandidatePoolEntry {
+        is_writable: is_writable_source(config, repo_file.source_index),
         id: repo_file.path.clone(),
         tokens: tokens(&repo_file.text).with_context(|| format!("tokenizing {}", repo_file.path))?,
         candidate: Candidate {
@@ -547,8 +628,13 @@ fn score_candidate(
     block_without_prompts: &str,
     block_tokens: &[String],
 ) -> Result<Option<CandidateInfo>> {
-    let plan = lightbulb::plan_for(block, &pool_entry.candidate)
-        .with_context(|| format!("looking for a fix in {}", pool_entry.id))?;
+    // Code read from git can't be changed here
+    let plan = if pool_entry.is_writable {
+        lightbulb::plan_for(block, &pool_entry.candidate)
+            .with_context(|| format!("looking for a fix in {}", pool_entry.id))?
+    } else {
+        None
+    };
     let code = pool_entry.candidate.marked_code;
     let doc_options = candidate_doc_options(code, plan.as_ref());
     let block_side = doc_side(block, &doc_options).unwrap_or_else(|| block.content.clone());

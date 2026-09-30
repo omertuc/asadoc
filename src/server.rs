@@ -2,14 +2,14 @@
 //! only presents; everything it shows is computed here, and every change it
 //! asks for is made here.
 
-use crate::config::{AsadocConfig, SourceLinkBases};
+use crate::config::{AsadocConfig, Docs};
 use crate::docs;
 use crate::eval::{self, AssemblyEval, BlockEval, CandidateInfo, Evaluation, FormerIgnoredEntry};
-use crate::ignored::{self, IgnoredBlocks};
+use crate::ignored::{IgnoreReason, IgnoredBlocks};
 use crate::lightbulb;
 use crate::markers::MarkerOption;
 use crate::matching::PlaceholderValues;
-use crate::repo::{self, MarkedCode, MarkerProblem};
+use crate::repo::{MarkedCode, MarkerProblem};
 use anyhow::{Context, Result, anyhow};
 use axum::Router;
 use axum::extract::{Query, State};
@@ -45,18 +45,38 @@ struct AppState {
 type SharedState = Arc<AppState>;
 
 pub(crate) fn serve(config: AsadocConfig, port: u16) -> Result<()> {
+    // Bound first so a taken port fails right away, not after the warm-up
+    let std_listener =
+        std::net::TcpListener::bind(("127.0.0.1", port)).with_context(|| format!("listening on port {port}"))?;
+    std_listener
+        .set_nonblocking(true)
+        .context("making the listener non-blocking")?;
+    println!("asadoc: preparing the review UI...");
+    warm_up(&config).context("preparing the review UI")?;
     let runtime = Runtime::new().context("starting the async runtime")?;
     runtime.block_on(async move {
         let (change_sender, _) = broadcast::channel(16);
         let state = Arc::new(AppState { config, change_sender });
         let _watcher = watch_repos(Arc::clone(&state)).context("watching the repos for changes")?;
-        let listener = TcpListener::bind(("127.0.0.1", port))
-            .await
-            .with_context(|| format!("listening on port {port}"))?;
+        let listener = TcpListener::from_std(std_listener).context("setting up the listener")?;
         println!("asadoc: review UI at http://localhost:{port}");
         axum::serve(listener, router(state)).await.context("serving HTTP")?;
         anyhow::Ok(())
     })
+}
+
+/// Does up front what the first page load would: an evaluation, and reading
+/// the attributes modules render with. With docs from git, that fetches every
+/// file the UI needs into the cache, so the page opens without waiting on it
+fn warm_up(config: &AsadocConfig) -> Result<()> {
+    eval::evaluate(config, true).context("evaluating the doc blocks")?;
+    for docs in &config.docs {
+        for assembly_path in &docs.assemblies {
+            docs::assembly_attributes(&docs.source, assembly_path)
+                .with_context(|| format!("reading the attributes of {}", docs.qualify(assembly_path)))?;
+        }
+    }
+    Ok(())
 }
 
 fn router(state: SharedState) -> Router {
@@ -108,12 +128,23 @@ fn watch_repos(state: SharedState) -> Result<RecommendedWatcher> {
         }
     })
     .context("creating the file watcher")?;
-    let repo_root = &state.config.repo_root;
-    watcher
-        .watch(repo_root, RecursiveMode::Recursive)
-        .with_context(|| format!("watching {}", repo_root.display()))?;
-    // Docs from git are fixed at the fetched commit
-    if let Some(modules_dir) = state.config.docs.local_modules_dir() {
+    // Code and docs from git are fixed at the fetched commit
+    for code_root in state
+        .config
+        .code
+        .iter()
+        .filter_map(|code_source| code_source.tree.local_root())
+    {
+        watcher
+            .watch(code_root, RecursiveMode::Recursive)
+            .with_context(|| format!("watching {}", code_root.display()))?;
+    }
+    for modules_dir in state
+        .config
+        .docs
+        .iter()
+        .filter_map(|docs| docs.source.local_modules_dir())
+    {
         watcher
             .watch(&modules_dir, RecursiveMode::NonRecursive)
             .with_context(|| format!("watching {}", modules_dir.display()))?;
@@ -162,10 +193,17 @@ struct CodeRef {
     options: Vec<MarkerOption>,
     doc_options: Vec<MarkerOption>,
     values: Option<PlaceholderValues>,
+    /// Where its file is on the web, when its code source says
+    link: Option<String>,
 }
 
-fn code_ref(marked_code: &MarkedCode, values: Option<&PlaceholderValues>) -> CodeRef {
+fn code_ref(config: &AsadocConfig, marked_code: &MarkedCode, values: Option<&PlaceholderValues>) -> CodeRef {
+    let link = config
+        .code_file(&marked_code.file)
+        .ok()
+        .and_then(|(code_source, path)| code_source.link.as_ref().map(|link_base| format!("{link_base}{path}")));
     CodeRef {
+        link,
         id: marked_code.id.clone(),
         file: marked_code.file.clone(),
         snippet: marked_code.section.clone(),
@@ -206,9 +244,16 @@ struct BlockData {
 }
 
 #[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
 struct GuideData {
     id: String,
     title: String,
+    /// The name of its docs source, when there are several
+    docs_name: Option<String>,
+    /// Where its docs are, for people
+    docs_location: String,
+    /// Base URL for links to its docs' files
+    docs_link: Option<String>,
     blocks: Vec<BlockData>,
     resolved: Vec<BlockData>,
     ignored: Vec<BlockData>,
@@ -249,23 +294,21 @@ struct ReportData {
     #[serde(rename = "total")]
     total_blocks: usize,
     stale_ignored: Vec<StaleIgnored>,
+    ignore_reasons: Vec<IgnoreReason>,
     #[serde(rename = "code")]
     marked_code: Vec<CodeData>,
     problems: Vec<MarkerProblem>,
-    /// Where the docs are, for people
-    docs_location: String,
-    links: SourceLinkBases,
 }
 
 /// Each marked code, with the blocks that match or resemble it
-fn code_data(evaluation: &Evaluation) -> Vec<CodeData> {
+fn code_data(config: &AsadocConfig, evaluation: &Evaluation) -> Vec<CodeData> {
     evaluation
         .scan
         .marked
         .iter()
         .enumerate()
         .map(|(code_index, marked_code)| CodeData {
-            code_ref: code_ref(marked_code, None),
+            code_ref: code_ref(config, marked_code, None),
             matched_by: matched_by(evaluation, code_index),
             resembled_by: resembled_by(evaluation, marked_code),
         })
@@ -315,7 +358,12 @@ fn build_report(config: &AsadocConfig, evaluation: &Evaluation) -> Result<Report
         .assemblies
         .iter()
         .map(|assembly| {
-            guide_data(evaluation, assembly).with_context(|| format!("reporting on {}", assembly.assembly.id))
+            let docs = config
+                .docs
+                .get(assembly.assembly.docs_index)
+                .with_context(|| format!("no docs source for {}", assembly.assembly.id))?;
+            guide_data(config, evaluation, docs, assembly)
+                .with_context(|| format!("reporting on {}", assembly.assembly.id))
         })
         .collect::<Result<_>>()?;
     Ok(ReportData {
@@ -329,18 +377,25 @@ fn build_report(config: &AsadocConfig, evaluation: &Evaluation) -> Result<Report
                 content: content.clone(),
             })
             .collect(),
-        marked_code: code_data(evaluation),
+        ignore_reasons: evaluation.ignore_reasons.clone(),
+        marked_code: code_data(config, evaluation),
         problems: evaluation.scan.problems.clone(),
-        docs_location: config.docs.describe(),
-        links: config.links.clone(),
     })
 }
 
 /// An assembly's blocks: to resolve, resolved, and ignored
-fn guide_data(evaluation: &Evaluation, assembly: &AssemblyEval) -> Result<GuideData> {
+fn guide_data(
+    config: &AsadocConfig,
+    evaluation: &Evaluation,
+    docs: &Docs,
+    assembly: &AssemblyEval,
+) -> Result<GuideData> {
     Ok(GuideData {
         id: assembly.assembly.id.clone(),
         title: assembly.assembly.title.clone(),
+        docs_name: docs.name.clone(),
+        docs_location: docs.source.describe(),
+        docs_link: docs.link.clone(),
         blocks: assembly
             .blocks
             .iter()
@@ -361,6 +416,7 @@ fn guide_data(evaluation: &Evaluation, assembly: &AssemblyEval) -> Result<GuideD
                     .iter()
                     .map(|code_match| {
                         Ok(code_ref(
+                            config,
                             evaluation.marked(code_match.marked_index)?,
                             Some(&code_match.values),
                         ))
@@ -472,30 +528,34 @@ struct ModuleQuery {
 
 /// A module's text and the attributes it needs, for rendering in the browser
 async fn serve_module(State(state): State<SharedState>, Query(module_query): Query<ModuleQuery>) -> ApiResult {
-    let config = &state.config;
-    let assembly_path = find_assembly(config, &module_query.assembly_id)
+    let (docs, assembly_path) = find_assembly(&state.config, &module_query.assembly_id)
         .context("finding the assembly")?
         .with_context(|| format!("no assembly {}", module_query.assembly_id))
         .status(StatusCode::NOT_FOUND)?;
     if !is_plain_module_name(&module_query.module) {
         return Err(anyhow!("bad module name {:?}", module_query.module)).status(StatusCode::BAD_REQUEST);
     }
-    let module_text = docs::module_for_rendering(&config.docs, &module_query.module)
+    let module_text = docs::module_for_rendering(&docs.source, &module_query.module)
         .with_context(|| format!("reading the module {}", module_query.module))?
         .with_context(|| format!("no module {}", module_query.module))
         .status(StatusCode::NOT_FOUND)?;
-    let attributes = docs::assembly_attributes(&config.docs, assembly_path)
+    let attributes = docs::assembly_attributes(&docs.source, assembly_path)
         .with_context(|| format!("reading the attributes of {assembly_path}"))?;
     Ok(Json(json!({ "text": module_text, "attributes": attributes })).into_response())
 }
 
-/// The path of the assembly with the given `assembly_id`, if any
-fn find_assembly<'config>(config: &'config AsadocConfig, assembly_id: &str) -> Result<Option<&'config String>> {
-    for assembly_path in &config.assemblies {
-        let assembly = docs::read_assembly(&config.docs, assembly_path)
-            .with_context(|| format!("reading the assembly {assembly_path}"))?;
-        if assembly.id == assembly_id {
-            return Ok(Some(assembly_path));
+/// The docs source and path of the assembly with the given `assembly_id`, if any
+fn find_assembly<'config>(
+    config: &'config AsadocConfig,
+    assembly_id: &str,
+) -> Result<Option<(&'config Docs, &'config String)>> {
+    for (docs_index, docs) in config.docs.iter().enumerate() {
+        for assembly_path in &docs.assemblies {
+            let assembly = docs::read_assembly(docs, docs_index, assembly_path)
+                .with_context(|| format!("reading the assembly {}", docs.qualify(assembly_path)))?;
+            if assembly.id == assembly_id {
+                return Ok(Some((docs, assembly_path)));
+            }
         }
     }
     Ok(None)
@@ -512,15 +572,19 @@ struct FileQuery {
     path: String,
 }
 
-/// A repo file's text; only plain relative paths inside the repo
+/// A code file's text, by its name among all the code sources; only plain
+/// relative paths inside a source
 async fn serve_file(State(state): State<SharedState>, Query(file_query): Query<FileQuery>) -> ApiResult {
-    let is_plain_relative = Path::new(&file_query.path)
+    let (code_source, path) = state.config.code_file(&file_query.path)?;
+    let is_plain_relative = Path::new(path)
         .components()
         .all(|component| matches!(component, Component::Normal(_)));
     if !is_plain_relative {
         return Err(anyhow!("bad path {:?}", file_query.path)).status(StatusCode::BAD_REQUEST);
     }
-    let file_text = repo::read_repo_file(&state.config.repo_root, &file_query.path)
+    let file_text = code_source
+        .tree
+        .read(path)
         .with_context(|| format!("reading {}", file_query.path))?
         .with_context(|| format!("no text file {}", file_query.path))
         .status(StatusCode::NOT_FOUND)?;
@@ -542,6 +606,9 @@ struct BlockAction {
     reason: Option<String>,
     #[serde(rename = "replacing")]
     replacing_content: Option<String>,
+    /// With `reason`, when ignoring: a new reason, meaning this
+    #[serde(rename = "newReason")]
+    new_reason_description: Option<String>,
 }
 
 fn success_response() -> Response {
@@ -570,13 +637,11 @@ async fn apply_fix(State(state): State<SharedState>, Json(action): Json<BlockAct
             .and_then(|candidate| candidate.plan.as_ref().map(|fix_plan| (candidate, fix_plan)))
             .with_context(|| format!("{candidate_id} has no fix for {} anymore", action.reference))
             .status(StatusCode::CONFLICT)?;
-        lightbulb::apply(
-            &config.repo_root,
-            &candidate.file,
-            candidate.section_name.as_deref(),
-            fix_plan,
-        )
-        .with_context(|| format!("applying the fix to {candidate_id}"))?;
+        let file_path = config
+            .writable_code_file(&candidate.file)
+            .status(StatusCode::CONFLICT)?;
+        lightbulb::apply(&file_path, candidate.section_name.as_deref(), fix_plan)
+            .with_context(|| format!("applying the fix to {candidate_id}"))?;
         println!("Fixed {candidate_id} for {}", action.reference);
         Ok(success_response())
     })
@@ -585,18 +650,32 @@ async fn apply_fix(State(state): State<SharedState>, Json(action): Json<BlockAct
 
 /// Loads the ignore directory and makes a change to it
 fn update_ignored(config: &AsadocConfig, change: impl FnOnce(&mut IgnoredBlocks) -> Result<()>) -> Result<()> {
-    let mut ignored_blocks = IgnoredBlocks::load(&config.ignore_dir).context("loading the ignore directory")?;
+    let mut ignored_blocks = IgnoredBlocks::load_all(config).context("loading the ignore directories")?;
     change(&mut ignored_blocks)
 }
 
 async fn ignore_block(State(state): State<SharedState>, Json(action): Json<BlockAction>) -> ApiResult {
     with_evaluation(&state, move |config, evaluation| {
         let reason = action.reason.clone().unwrap_or_default();
-        if !ignored::IGNORE_REASONS.contains(&reason.as_str()) {
-            return Err(anyhow!("invalid reason {reason:?}")).status(StatusCode::BAD_REQUEST);
+        let is_known_reason = evaluation
+            .ignore_reasons
+            .iter()
+            .any(|known_reason| known_reason.name == reason);
+        if is_known_reason == action.new_reason_description.is_some() {
+            let problem = if is_known_reason {
+                "already exists"
+            } else {
+                "doesn't exist"
+            };
+            return Err(anyhow!("the reason {reason:?} {problem}")).status(StatusCode::BAD_REQUEST);
         }
         let block = find_block(&evaluation, &action)?;
         update_ignored(config, |ignored_blocks| {
+            if let Some(description) = &action.new_reason_description {
+                ignored_blocks
+                    .add_reason(&reason, description)
+                    .with_context(|| format!("adding the reason {reason}"))?;
+            }
             ignored_blocks.ignore(
                 &block.block.content,
                 &reason,
