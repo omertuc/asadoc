@@ -18,7 +18,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub(crate) const CONFIG_FILE_NAME: &str = "asadoc.yaml";
+pub(crate) const CONFIG_FILE_NAME: &str = ".asadoc.yaml";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
