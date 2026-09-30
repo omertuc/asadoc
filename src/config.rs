@@ -18,6 +18,7 @@
 //! ref = "main"                 # or path = "../../installer"
 //! ```
 
+use crate::links::ExternalLinks;
 use crate::source::{GitTree, Tree};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
@@ -43,9 +44,9 @@ struct RawAsadocConfig {
     /// Repo paths (prefixes) never scanned for markers
     #[serde(default)]
     exclude: Vec<String>,
-    /// Base URLs for "source" links in the UI
-    #[serde(default)]
-    links: SourceLinkBases,
+    /// This repo's; see `RawDocs::external_link_format`
+    #[serde(rename = "external-link-format")]
+    external_link_format: Option<String>,
 }
 
 /// A docs source: where the docs are, and their format's settings (keyed by format)
@@ -60,9 +61,10 @@ struct RawDocs {
     git: Option<String>,
     #[serde(rename = "ref")]
     reference: Option<String>,
-    /// Base URL for links to the docs' files, e.g. <https://github.com/org/docs/blob/main>/
-    /// (default for GitHub repositories: the fetched commit)
-    link: Option<String>,
+    /// How the review UI links to its files on the web (see `links`): a kind
+    /// of host, a template, or `none`; detected for public hosts when omitted
+    #[serde(rename = "external-link-format")]
+    external_link_format: Option<String>,
     asciidoc: RawAsciidoc,
 }
 
@@ -78,9 +80,9 @@ struct RawCode {
     git: Option<String>,
     #[serde(rename = "ref")]
     reference: Option<String>,
-    /// Base URL for "source" links to its files (default for GitHub
-    /// repositories: the fetched commit)
-    link: Option<String>,
+    /// See `RawDocs::external_link_format`
+    #[serde(rename = "external-link-format")]
+    external_link_format: Option<String>,
 }
 
 /// What asadoc reads of another code repo's own config: what it ignores and
@@ -105,13 +107,6 @@ fn default_ignore_dir() -> PathBuf {
     PathBuf::from("ignore")
 }
 
-#[derive(Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct SourceLinkBases {
-    /// e.g. <https://github.com/org/repo/blob/main>/
-    repo: Option<String>,
-}
-
 /// One docs source
 pub(crate) struct Docs {
     /// Set when there are several sources: the prefix of its block references
@@ -119,8 +114,8 @@ pub(crate) struct Docs {
     pub name: Option<String>,
     pub source: Tree,
     pub assemblies: Vec<String>,
-    /// Base URL for links to the docs' files
-    pub link: Option<String>,
+    /// How to link to the docs' files on the web
+    pub links: Option<ExternalLinks>,
 }
 
 impl Docs {
@@ -152,8 +147,8 @@ pub(crate) struct CodeSource {
     /// For another repo: its ignore directory, relative to its root (this
     /// repo's is `AsadocConfig::ignore_dir`)
     pub ignore_dir: Option<String>,
-    /// Base URL for "source" links to its files
-    pub link: Option<String>,
+    /// How to link to its files on the web
+    pub links: Option<ExternalLinks>,
 }
 
 impl CodeSource {
@@ -218,7 +213,8 @@ impl AsadocConfig {
                     None => configured_docs(&config_path, &config_dir, &raw_docs)?,
                 };
                 Ok(Docs {
-                    link: raw_docs.link.or_else(|| source.default_link_base()),
+                    links: external_links(raw_docs.external_link_format.as_deref(), &source)
+                        .with_context(|| format!("in {}", config_path.display()))?,
                     name: raw_docs.name.filter(|_| is_several),
                     source,
                     assemblies: raw_docs.asciidoc.assemblies,
@@ -232,12 +228,14 @@ impl AsadocConfig {
             .strip_prefix(&repo_root)
             .ok()
             .map(|relative_ignore_dir| format!("{}/", relative_ignore_dir.display()));
+        let this_repo_tree = Tree::Local(repo_root);
         let this_repo = CodeSource {
             name: None,
-            tree: Tree::Local(repo_root),
+            links: external_links(raw_config.external_link_format.as_deref(), &this_repo_tree)
+                .with_context(|| format!("in {}", config_path.display()))?,
+            tree: this_repo_tree,
             exclude: raw_config.exclude.into_iter().chain(ignore_dir_exclude).collect(),
             ignore_dir: None,
-            link: raw_config.links.repo,
         };
         let other_code = other_code_sources(&config_path, &config_dir, raw_config.code, code_overrides)?;
         Ok(Self {
@@ -307,7 +305,8 @@ fn other_code_sources(
             let other_config = other_config(&tree).with_context(|| format!("reading the config of {which_code}"))?;
             let ignore_dir = normalized_relative_path(&Path::new(".asadoc").join(&other_config.ignore_dir));
             Ok(CodeSource {
-                link: raw_code.link.or_else(|| tree.default_link_base()),
+                links: external_links(raw_code.external_link_format.as_deref(), &tree)
+                    .with_context(|| format!("in {}: {which_code}", config_path.display()))?,
                 exclude: other_config
                     .exclude
                     .into_iter()
@@ -319,6 +318,11 @@ fn other_code_sources(
             })
         })
         .collect()
+}
+
+/// How to link to a docs or code source's files, per its `external-link-format`
+fn external_links(setting: Option<&str>, tree: &Tree) -> Result<Option<ExternalLinks>> {
+    ExternalLinks::new(setting, tree.remote()?.as_deref(), tree.commit()?.as_deref())
 }
 
 /// What another code repo's own config says (the defaults when it has none)

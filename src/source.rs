@@ -121,13 +121,24 @@ impl Tree {
         }
     }
 
-    /// Base URL for links to files, for GitHub repositories
-    pub(crate) fn default_link_base(&self) -> Option<String> {
-        let Self::Git(git_tree) = self else { return None };
-        let repo_url = git_tree.url.strip_suffix(".git").unwrap_or(&git_tree.url);
-        repo_url
-            .starts_with("https://github.com/")
-            .then(|| format!("{repo_url}/blob/{}/", git_tree.commit))
+    /// Where the repo is published: the git URL, or a checkout's `origin`
+    pub(crate) fn remote(&self) -> Result<Option<String>> {
+        match self {
+            Self::Local(root) => {
+                Ok(try_git_stdout(root, &["remote", "get-url", "origin"])?.map(|remote| remote.trim().to_owned()))
+            }
+            Self::Git(git_tree) => Ok(Some(git_tree.url.clone())),
+        }
+    }
+
+    /// The commit the files are at: the fetched one, or a checkout's HEAD
+    /// (None when it has no commit yet)
+    pub(crate) fn commit(&self) -> Result<Option<String>> {
+        match self {
+            Self::Local(root) => Ok(try_git_stdout(root, &["rev-parse", "--verify", "--quiet", "HEAD"])?
+                .map(|commit| commit.trim().to_owned())),
+            Self::Git(git_tree) => Ok(Some(git_tree.commit.clone())),
+        }
     }
 }
 

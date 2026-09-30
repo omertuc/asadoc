@@ -201,7 +201,12 @@ fn code_ref(config: &AsadocConfig, marked_code: &MarkedCode, values: Option<&Pla
     let link = config
         .code_file(&marked_code.file)
         .ok()
-        .and_then(|(code_source, path)| code_source.link.as_ref().map(|link_base| format!("{link_base}{path}")));
+        .and_then(|(code_source, path)| {
+            code_source
+                .links
+                .as_ref()
+                .map(|links| links.file(path, marked_code.line_range))
+        });
     CodeRef {
         link,
         id: marked_code.id.clone(),
@@ -231,6 +236,8 @@ struct BlockData {
     content: String,
     section: Option<String>,
     lead: Option<String>,
+    /// Where the block is on the web, when its docs source says
+    link: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     candidates: Option<Vec<CandidateInfo>>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -252,8 +259,6 @@ struct GuideData {
     docs_name: Option<String>,
     /// Where its docs are, for people
     docs_location: String,
-    /// Base URL for links to its docs' files
-    docs_link: Option<String>,
     blocks: Vec<BlockData>,
     resolved: Vec<BlockData>,
     ignored: Vec<BlockData>,
@@ -395,7 +400,6 @@ fn guide_data(
         title: assembly.assembly.title.clone(),
         docs_name: docs.name.clone(),
         docs_location: docs.source.describe(),
-        docs_link: docs.link.clone(),
         blocks: assembly
             .blocks
             .iter()
@@ -403,7 +407,7 @@ fn guide_data(
             .map(|block| BlockData {
                 candidates: Some(block.candidates.clone()),
                 former_ignored_entries: Some(block.former_ignored_entries.clone()),
-                ..block_data(assembly, block)
+                ..block_data(docs, assembly, block)
             })
             .collect(),
         resolved: assembly
@@ -425,7 +429,7 @@ fn guide_data(
                     .with_context(|| format!("listing the code {} matches", block.block.reference))?;
                 Ok(BlockData {
                     matched_code: Some(matched_code),
-                    ..block_data(assembly, block)
+                    ..block_data(docs, assembly, block)
                 })
             })
             .collect::<Result<_>>()?,
@@ -435,15 +439,19 @@ fn guide_data(
             .filter(|block| block.ignored_as.is_some())
             .map(|block| BlockData {
                 ignored_as: block.ignored_as.clone(),
-                ..block_data(assembly, block)
+                ..block_data(docs, assembly, block)
             })
             .collect(),
     })
 }
 
 /// What every listing shows of a block
-fn block_data(assembly: &AssemblyEval, block: &BlockEval) -> BlockData {
+fn block_data(docs: &Docs, assembly: &AssemblyEval, block: &BlockEval) -> BlockData {
     BlockData {
+        link: docs
+            .links
+            .as_ref()
+            .map(|links| links.source_line(&docs::module_path(&block.block.module), block.block.line)),
         assembly_id: assembly.assembly.id.clone(),
         reference: block.block.reference.clone(),
         module: block.block.module.clone(),

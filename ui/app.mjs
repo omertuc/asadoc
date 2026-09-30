@@ -544,7 +544,7 @@ function blockHeader(b, guide, withPrompt) {
     <div class="crumbs">${esc(guideLabel(guide))}${b.section ? ` › ${esc(b.section)}` : ''}</div>
     <div class="head-row">
       <span class="ref">${esc(b.ref)}</span>
-      ${guide.docsLink ? `<a href="${guide.docsLink}modules/${b.module}.adoc?plain=1#L${b.line}" target="_blank">Doc source ↗</a>` : ''}
+      ${b.link ? `<a href="${b.link}" target="_blank">Doc source ↗</a>` : ''}
       ${withPrompt ? '<button class="secondary copy-prompt" title="A prompt for your AI assistant to link this block">Copy AI prompt</button>' : ''}
     </div>`;
   head.querySelector('.copy-prompt')?.addEventListener('click', () => copyPrompt(b));
@@ -641,7 +641,7 @@ function renderMarkedCode(c) {
     <div class="crumbs">Marked code</div>
     <div class="head-row">
       <span class="ref">${esc(c.file)}</span>${where}
-      ${c.link ? `<a href="${c.link}${c.lines ? `#L${c.lines[0]}-L${c.lines[1]}` : ''}" target="_blank">Source ↗</a>` : ''}
+      ${c.link ? `<a href="${c.link}" target="_blank">Source ↗</a>` : ''}
     </div>`));
 
   const sec = el('section', 'resolved');

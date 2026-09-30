@@ -7,6 +7,7 @@ mod docs;
 mod eval;
 mod ignored;
 mod lightbulb;
+mod links;
 mod markers;
 mod matching;
 mod repo;

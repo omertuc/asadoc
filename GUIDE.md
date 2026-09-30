@@ -170,9 +170,6 @@ ref = "main"               # branch, tag or commit; a commit pins the check
 assemblies = [             # whose modules' code blocks must come from this repo
   "networking/dpf/dpf-operator-installation.adoc",
 ]
-
-[links]
-repo = "https://github.com/org/repo/blob/main/"   # for "source" links in the UI
 ```
 
 Paths in it are relative to `.asadoc/`.
@@ -181,8 +178,6 @@ asadoc fetches just `ref` of the docs repo, and only the files it reads, into
 `~/.cache/asadoc/`. Instead of `git` and `ref`, `path = "../../openshift-docs"` reads
 a local checkout as it is on disk (and `asadoc serve` then follows its changes);
 `--docs <dir>` does the same for one run, e.g. to try unmerged docs changes.
-Links to the docs default to the fetched commit on GitHub (`link = "<base URL>"`
-next to `git` overrides them).
 
 For docs in several repos (or one repo at several refs), add a `[[docs]]` for
 each, with a `name`; the `[docs.asciidoc]` after a `[[docs]]` belongs to it:
@@ -208,8 +203,7 @@ serves them all. `--docs <name>=<dir>` replaces one of them for a run.
 ### Code in several repos
 
 When the docs' code comes from several repos, list the others as `[[code]]`,
-each with a `name`, and `git` and `ref` or a local `path` (plus `link`, the
-base URL for its "source" links, which defaults to the fetched commit on GitHub):
+each with a `name`, and `git` and `ref` or a local `path`:
 
 ```toml
 [[code]]
@@ -231,6 +225,25 @@ for this repo only: the other repos may check other docs. Each repo that runs
 asadoc in its CI can have a config of its own, with the others as `[[code]]`.
 `--code <name>=<dir>` replaces one of them for a run, e.g. to try unmerged
 changes.
+
+### Links to the web
+
+The review UI links each doc block and each piece of marked code to its file
+on the web, at the commit asadoc read (the fetched one, or a local checkout's
+HEAD). How depends on where the repo is hosted, set by `external-link-format`
+in its `[[docs]]` or `[[code]]` (or at the top of the config, for this repo):
+
+- Left out, it's detected from the repo's `git` URL (or a checkout's `origin`
+  remote), for github.com, gitlab.com, codeberg.org and bitbucket.org. Other
+  hosts get no links.
+- `"github"`, `"gitlab"`, `"gitea"` (Forgejo too) or `"bitbucket"`: that kind
+  of host, at the remote's address. For self-hosted and enterprise instances,
+  e.g. `external-link-format = "gitlab"` for `git@gitlab.corp.example:team/repo.git`.
+- A template with `{path}`, and any of `{repo}` (the remote's web address,
+  `https://<host>/<path>`), `{commit}`, `{first-line}` and `{last-line}`. Links
+  to a whole file drop everything from the `#`:
+  `external-link-format = "https://code.corp/browse/{path}?at={commit}#{first-line}-{last-line}"`
+- `"none"`: no links.
 
 ## Commands
 
