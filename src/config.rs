@@ -1,13 +1,13 @@
-//! `asadoc.yaml`: where the docs are, which of them to check, and where the
-//! directory of ignored doc blocks is. Paths are relative to the config file.
+//! `.asadoc/config.toml`: where the docs are, which of them to check, and where
+//! the directory of ignored doc blocks is. Paths are relative to the config
+//! file's directory (`.asadoc/`).
 //!
-//! ```yaml
-//! docs:
-//!   asciidoc:                  # the docs' format (the only one, for now)
-//!     git: https://github.com/openshift/openshift-docs
-//!     ref: main                # branch, tag or commit
-//!     # or, instead of git and ref, a local checkout: path: ../openshift-docs
-//!     assemblies: [...]
+//! ```toml
+//! [docs.asciidoc]              # the docs' format (the only one, for now)
+//! git = "https://github.com/openshift/openshift-docs"
+//! ref = "main"                 # branch, tag or commit
+//! # or, instead of git and ref, a local checkout: path = "../../openshift-docs"
+//! assemblies = [...]
 //! ```
 
 use crate::source::{DocsSource, GitDocs};
@@ -18,7 +18,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-pub(crate) const CONFIG_FILE_NAME: &str = ".asadoc.yaml";
+pub(crate) const CONFIG_FILE_NAME: &str = ".asadoc/config.toml";
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -57,7 +57,7 @@ struct RawAsciidoc {
 }
 
 fn default_ignore_dir() -> PathBuf {
-    PathBuf::from(".asadoc-ignore")
+    PathBuf::from("ignore")
 }
 
 #[derive(Deserialize, Default, Clone, Serialize)]
@@ -81,7 +81,7 @@ pub(crate) struct AsadocConfig {
 }
 
 impl AsadocConfig {
-    /// Loads `path`, or the nearest `asadoc.yaml` from the working directory up.
+    /// Loads `path`, or the nearest `.asadoc/config.toml` from the working directory up.
     pub(crate) fn load(config_path: Option<&Path>, docs_override: Option<&Path>) -> Result<Self> {
         let config_path = match config_path {
             Some(given_path) => given_path.to_path_buf(),
@@ -90,7 +90,7 @@ impl AsadocConfig {
         let config_text =
             fs::read_to_string(&config_path).with_context(|| format!("reading {}", config_path.display()))?;
         let raw_config: RawAsadocConfig =
-            serde_yaml::from_str(&config_text).with_context(|| format!("parsing {}", config_path.display()))?;
+            toml::from_str(&config_text).with_context(|| format!("parsing {}", config_path.display()))?;
         let config_dir = config_path
             .canonicalize()
             .with_context(|| format!("resolving {}", config_path.display()))?

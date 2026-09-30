@@ -7,7 +7,7 @@ changes (its code, or the markers on it), or the doc block gets ignored.
 ## Doc blocks
 
 Every `[source,…]` block in the modules included by the assemblies listed in
-`asadoc.yaml`. A block's content is the lines between its `----` delimiters,
+`.asadoc/config.toml`. A block's content is the lines between its `----` delimiters,
 ending with a newline. Tools refer to a block as `<module>/<lang>-<NNN>`, e.g.
 `nw-dpf-creating-bfb/yaml-001` is the first YAML block in
 `modules/nw-dpf-creating-bfb.adoc`. That name is only the block's current
@@ -97,7 +97,7 @@ read, or an option that doesn't fit the code, is reported as a marker problem.
 ## Ignored blocks
 
 Doc blocks that don't come from the repo are ignored by putting their exact
-content in a file under `.asadoc-ignore/` (next to `asadoc.yaml`; `ignore_dir`
+content in a file under `.asadoc/ignore/` (next to `config.toml`; `ignore_dir`
 changes it), in a subdirectory for the reason:
 
 - `example-output/`: sample output shown to the reader
@@ -105,7 +105,7 @@ changes it), in a subdirectory for the reason:
 - `no-repo-source/`: content with no counterpart in the repo
 
 ```text
-.asadoc-ignore/
+.asadoc/ignore/
   example-output/nw-dpf-worker-machineconfig--terminal-005.txt
   manual-command/nw-dpf-management-cluster-setup--terminal-002.txt
 ```
@@ -118,7 +118,7 @@ covers every block with the same content.
 
 A doc block is **resolved** when some marked code, with its options applied, is
 byte-for-byte the block (with the marker's `doc` options applied) apart from its
-placeholders. A block whose content is in a file under `.asadoc-ignore/` is
+placeholders. A block whose content is in a file under `.asadoc/ignore/` is
 **ignored**.
 Every other block is still **to resolve**.
 
@@ -150,21 +150,24 @@ When marking a file or lines of one (plus a `---` or trailing newlines) is all
 a block needs, `asadoc check` lists the change under it, and `asadoc fix <ref>`
 makes it.
 
-## asadoc.yaml
+## .asadoc/config.toml
 
-```yaml
-docs:
-  asciidoc:                # the docs' format (only AsciiDoc, for now)
-    git: https://github.com/openshift/openshift-docs
-    ref: main              # branch, tag or commit; a commit pins the check
-    assemblies:            # whose modules' code blocks must come from this repo
-      - networking/dpf/dpf-operator-installation.adoc
-links:
-  repo: https://github.com/org/repo/blob/main/   # for "source" links in the UI
+```toml
+[docs.asciidoc]            # the docs' format (only AsciiDoc, for now)
+git = "https://github.com/openshift/openshift-docs"
+ref = "main"               # branch, tag or commit; a commit pins the check
+assemblies = [             # whose modules' code blocks must come from this repo
+  "networking/dpf/dpf-operator-installation.adoc",
+]
+
+[links]
+repo = "https://github.com/org/repo/blob/main/"   # for "source" links in the UI
 ```
 
+Paths in it are relative to `.asadoc/`.
+
 asadoc fetches just `ref` of the docs repo, and only the files it reads, into
-`~/.cache/asadoc/`. Instead of `git` and `ref`, `path: ../openshift-docs` reads
+`~/.cache/asadoc/`. Instead of `git` and `ref`, `path = "../../openshift-docs"` reads
 a local checkout as it is on disk (and `asadoc serve` then follows its changes);
 `--docs <dir>` does the same for one run, e.g. to try unmerged docs changes.
 Links to the docs default to the fetched commit on GitHub (`links.docs`

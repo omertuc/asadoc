@@ -23,7 +23,7 @@ use std::process::ExitCode;
 #[derive(Parser)]
 #[command(version)]
 struct AsadocCli {
-    /// The config file (default: the nearest asadoc.yaml from here up)
+    /// The config file (default: the nearest .asadoc/config.toml from here up)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
     /// A local docs checkout, instead of the docs in the config

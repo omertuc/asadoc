@@ -1,9 +1,9 @@
-//! The ignore directory (`.asadoc-ignore/` by default): doc blocks that don't
+//! The ignore directory (`.asadoc/ignore/` by default): doc blocks that don't
 //! come from the repo. One file per ignored block content, verbatim, in a
 //! subdirectory named after the reason:
 //!
 //! ```text
-//! .asadoc-ignore/
+//! .asadoc/ignore/
 //!   example-output/nw-dpf-worker-machineconfig--terminal-005.txt
 //!   manual-command/nw-dpf-management-cluster-setup--terminal-002.txt
 //!   no-repo-source/…
