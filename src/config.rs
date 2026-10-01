@@ -4,7 +4,7 @@
 //!
 //! ```toml
 //! [[docs]]                     # one per docs source
-//! name = "openshift"           # names its blocks; needed when there are several
+//! name = "openshift"           # prefixes its blocks' references
 //! git = "https://github.com/openshift/openshift-docs"
 //! ref = "main"                 # branch, tag or commit
 //! # or, instead of git and ref, a local checkout: path = "../../openshift-docs"
@@ -41,9 +41,6 @@ struct RawAsadocConfig {
     /// Directory of doc blocks that don't come from this repo
     #[serde(default = "default_ignore_dir")]
     ignore_dir: PathBuf,
-    /// Repo paths (prefixes) never scanned for markers
-    #[serde(default)]
-    exclude: Vec<String>,
     /// This repo's; see `RawDocs::external_link_format`
     #[serde(rename = "external-link-format")]
     external_link_format: Option<String>,
@@ -53,8 +50,8 @@ struct RawAsadocConfig {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawDocs {
-    /// Names the source's blocks and assemblies; needed when there are several sources
-    name: Option<String>,
+    /// Prefixes the references of the source's blocks and its assembly ids
+    name: String,
     /// A local docs checkout
     path: Option<PathBuf>,
     /// A docs git repository (URL, or local path), read at `ref`
@@ -85,14 +82,12 @@ struct RawCode {
     external_link_format: Option<String>,
 }
 
-/// What asadoc reads of another code repo's own config: what it ignores and
-/// excludes. The rest is its business.
+/// What asadoc reads of another code repo's own config: what it ignores. The
+/// rest is its business.
 #[derive(Deserialize)]
 struct RawOtherConfig {
     #[serde(default = "default_ignore_dir")]
     ignore_dir: PathBuf,
-    #[serde(default)]
-    exclude: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -109,9 +104,8 @@ fn default_ignore_dir() -> PathBuf {
 
 /// One docs source
 pub(crate) struct Docs {
-    /// Set when there are several sources: the prefix of its block references
-    /// and assembly ids, `<name>:`
-    pub name: Option<String>,
+    /// The prefix of its block references and assembly ids, `<name>:`
+    pub name: String,
     pub source: Tree,
     pub assemblies: Vec<String>,
     /// How to link to the docs' files on the web
@@ -121,18 +115,12 @@ pub(crate) struct Docs {
 impl Docs {
     /// A block reference or assembly id, as it's known among all the sources
     pub(crate) fn qualify(&self, local_name: &str) -> String {
-        match &self.name {
-            Some(name) => format!("{name}:{local_name}"),
-            None => local_name.to_owned(),
-        }
+        format!("{}:{local_name}", self.name)
     }
 
-    /// For people: the source's name (when it has one) and where the docs are
+    /// For people: the source's name and where the docs are
     pub(crate) fn describe(&self) -> String {
-        match &self.name {
-            Some(name) => format!("{name}: {}", self.source.describe()),
-            None => self.source.describe(),
-        }
+        format!("{}: {}", self.name, self.source.describe())
     }
 }
 
@@ -142,8 +130,9 @@ pub(crate) struct CodeSource {
     /// are prefixed with it, `<name>:<path>`
     pub name: Option<String>,
     pub tree: Tree,
-    /// Paths (prefixes) never scanned for markers
-    pub exclude: Vec<String>,
+    /// Its ignore directory as a path prefix (`<dir>/`), when it's in the
+    /// repo: it holds doc content, so it isn't searched for markers
+    pub ignore_dir_prefix: Option<String>,
     /// For another repo: its ignore directory, relative to its root (this
     /// repo's is `AsadocConfig::ignore_dir`)
     pub ignore_dir: Option<String>,
@@ -202,7 +191,6 @@ impl AsadocConfig {
             .to_path_buf();
         check_docs_names(&raw_config.docs).with_context(|| format!("in {}", config_path.display()))?;
         let override_dirs = override_dirs(&raw_config.docs, docs_overrides)?;
-        let is_several = raw_config.docs.len() > 1;
         let docs = raw_config
             .docs
             .into_iter()
@@ -215,7 +203,7 @@ impl AsadocConfig {
                 Ok(Docs {
                     links: external_links(raw_docs.external_link_format.as_deref(), &source)
                         .with_context(|| format!("in {}", config_path.display()))?,
-                    name: raw_docs.name.filter(|_| is_several),
+                    name: raw_docs.name,
                     source,
                     assemblies: raw_docs.asciidoc.assemblies,
                 })
@@ -223,8 +211,7 @@ impl AsadocConfig {
             .collect::<Result<Vec<_>>>()?;
         let repo_root = git_root(&config_dir).context("finding the repo the config file is in")?;
         let ignore_dir = config_dir.join(raw_config.ignore_dir);
-        // The ignore directory holds doc content, not code to match
-        let ignore_dir_exclude = ignore_dir
+        let ignore_dir_prefix = ignore_dir
             .strip_prefix(&repo_root)
             .ok()
             .map(|relative_ignore_dir| format!("{}/", relative_ignore_dir.display()));
@@ -234,7 +221,7 @@ impl AsadocConfig {
             links: external_links(raw_config.external_link_format.as_deref(), &this_repo_tree)
                 .with_context(|| format!("in {}", config_path.display()))?,
             tree: this_repo_tree,
-            exclude: raw_config.exclude.into_iter().chain(ignore_dir_exclude).collect(),
+            ignore_dir_prefix,
             ignore_dir: None,
         };
         let other_code = other_code_sources(&config_path, &config_dir, raw_config.code, code_overrides)?;
@@ -274,7 +261,7 @@ impl AsadocConfig {
 }
 
 /// The `[[code]]` sources, each with what its own config (if any) says it
-/// ignores and excludes
+/// ignores
 fn other_code_sources(
     config_path: &Path,
     config_dir: &Path,
@@ -307,11 +294,7 @@ fn other_code_sources(
             Ok(CodeSource {
                 links: external_links(raw_code.external_link_format.as_deref(), &tree)
                     .with_context(|| format!("in {}: {which_code}", config_path.display()))?,
-                exclude: other_config
-                    .exclude
-                    .into_iter()
-                    .chain(ignore_dir.as_ref().map(|ignore_dir| format!("{ignore_dir}/")))
-                    .collect(),
+                ignore_dir_prefix: ignore_dir.as_ref().map(|ignore_dir| format!("{ignore_dir}/")),
                 ignore_dir,
                 name: Some(raw_code.name),
                 tree,
@@ -330,7 +313,6 @@ fn other_config(tree: &Tree) -> Result<RawOtherConfig> {
     let Some(config_text) = tree.read(CONFIG_FILE_NAME)? else {
         return Ok(RawOtherConfig {
             ignore_dir: default_ignore_dir(),
-            exclude: vec![],
         });
     };
     toml::from_str(&config_text).with_context(|| format!("parsing its {CONFIG_FILE_NAME}"))
@@ -394,28 +376,21 @@ fn code_override_dirs(all_raw_code: &[RawCode], code_overrides: &[String]) -> Re
     Ok(override_dirs)
 }
 
-/// With several docs sources, each needs a distinct name
+/// Each `[[docs]]` needs a distinct name
 fn check_docs_names(all_raw_docs: &[RawDocs]) -> Result<()> {
     if all_raw_docs.is_empty() {
         bail!("no `[[docs]]`: the config needs at least one docs source");
     }
-    if let Some(bad_name) = all_raw_docs
-        .iter()
-        .filter_map(|raw_docs| raw_docs.name.as_deref())
-        .find(|name| !is_valid_source_name(name))
-    {
-        bail!("bad docs name {bad_name:?}: use letters, digits, `-`, `_` and `.`");
-    }
-    if all_raw_docs.len() == 1 {
-        return Ok(());
-    }
     let mut seen_names = HashSet::new();
     for raw_docs in all_raw_docs {
-        let Some(name) = raw_docs.name.as_deref() else {
-            bail!("with several `[[docs]]`, each needs a `name`: it prefixes the references of its doc blocks");
-        };
-        if !seen_names.insert(name) {
-            bail!("two `[[docs]]` are named {name:?}");
+        if !is_valid_source_name(&raw_docs.name) {
+            bail!(
+                "bad docs name {:?}: use letters, digits, `-`, `_` and `.`",
+                raw_docs.name
+            );
+        }
+        if !seen_names.insert(raw_docs.name.as_str()) {
+            bail!("two `[[docs]]` are named {:?}", raw_docs.name);
         }
     }
     Ok(())
@@ -428,30 +403,21 @@ fn is_valid_source_name(name: &str) -> bool {
             .all(|character| character.is_ascii_alphanumeric() || "-_.".contains(character))
 }
 
-/// The `--docs` checkout for each docs source, if any: `<dir>` with a single
-/// source, `<name>=<dir>` for any
+/// The `--docs <name>=<dir>` checkout for each docs source, if any
 fn override_dirs(all_raw_docs: &[RawDocs], docs_overrides: &[String]) -> Result<Vec<Option<PathBuf>>> {
     let mut override_dirs = vec![None; all_raw_docs.len()];
     for docs_override in docs_overrides {
-        let named_override = docs_override.split_once('=').and_then(|(name, docs_dir)| {
+        let Some((docs_index, docs_dir)) = docs_override.split_once('=').and_then(|(name, docs_dir)| {
             all_raw_docs
                 .iter()
-                .position(|raw_docs| raw_docs.name.as_deref() == Some(name))
+                .position(|raw_docs| raw_docs.name == name)
                 .map(|docs_index| (docs_index, docs_dir))
-        });
-        let (docs_index, docs_dir) = match named_override {
-            Some(named_override) => named_override,
-            None if all_raw_docs.len() == 1 => (0, docs_override.as_str()),
-            None => {
-                let names: Vec<&str> = all_raw_docs
-                    .iter()
-                    .filter_map(|raw_docs| raw_docs.name.as_deref())
-                    .collect();
-                bail!(
-                    "--docs {docs_override}: with several docs sources, say which as `--docs <name>=<dir>` (one of {})",
-                    names.join(", ")
-                );
-            }
+        }) else {
+            let names: Vec<&str> = all_raw_docs.iter().map(|raw_docs| raw_docs.name.as_str()).collect();
+            bail!(
+                "--docs {docs_override}: say which docs source as `--docs <name>=<dir>` (one of: {})",
+                names.join(", ")
+            );
         };
         if let Some(override_dir) = override_dirs.get_mut(docs_index) {
             *override_dir = Some(PathBuf::from(docs_dir));
@@ -462,10 +428,7 @@ fn override_dirs(all_raw_docs: &[RawDocs], docs_overrides: &[String]) -> Result<
 
 /// The docs the config file at `config_path` (in `config_dir`) points to
 fn configured_docs(config_path: &Path, config_dir: &Path, raw_docs: &RawDocs) -> Result<Tree> {
-    let which_docs = raw_docs
-        .name
-        .as_ref()
-        .map_or_else(|| "`docs`".to_owned(), |name| format!("docs {name:?}"));
+    let which_docs = format!("docs {:?}", raw_docs.name);
     match (&raw_docs.path, &raw_docs.git, &raw_docs.reference) {
         (Some(local_path), None, None) => {
             local_tree(&config_dir.join(local_path), "docs").context("opening the configured docs checkout")

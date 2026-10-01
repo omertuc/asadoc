@@ -15,17 +15,26 @@
 //! remove-suffix: "<text>"               strip <text> from the end of the last line
 //! strip-line-prefix: "<text>"           strip <text> from the start of every line that has it
 //! remove-lines-starting-with: "<text>"  drop lines whose text (after indentation) starts with <text>
+//! remove-text: "<regex>"                remove every match of <regex> (it may span lines)
 //! remove-blank-lines                    drop lines that are empty or only whitespace
 //! unindent-common                       remove the indentation all non-blank lines share
 //! reindent: <from> -> <to>              turn each <from> spaces of leading indentation into <to>
-//! param: "<text>"                       (code side only) <text> is a placeholder: it matches any value
-//!                                       on its line in the doc, the same value everywhere it appears
+//! param: "<text>"                       (code side only) <text> is a placeholder: it matches anything
+//!                                       without whitespace in the doc
+//! comment: "<text>"                     a note for people; changes nothing
+//! TODO: "<text>"                        a note of work left on this marker, listed by `asadoc check`
 //! ```
 //!
-//! In `param` and `remove-lines-starting-with`, `*` stands for any name
-//! (letters, digits and `_`): `param: "<*>"` makes every `<NAME>` in the code a
-//! placeholder, without the marker spelling any of them out.
+//! `remove-text`'s regex is written raw: a `\` is kept as it is, so `\s` means
+//! whitespace, and only `\"` is needed for a quote.
+//!
+//! In `param` and `remove-lines-starting-with`, `*` stands for any text
+//! without whitespace: `param: "<*>"` makes every `<NAME>` in the code a
+//! placeholder, without the marker spelling any of them out. A placeholder's
+//! value has no whitespace, except for placeholders from a `**` wildcard
+//! (`param: "<**>"`), whose value is anything on the line.
 
+use crate::matching::SpacedPlaceholders;
 use crate::re::capture_group_text;
 use anyhow::{Context, Result, anyhow, bail};
 use regex::Regex;
@@ -35,9 +44,6 @@ use std::iter::once;
 
 pub(crate) const MARKER_PREFIX: &str = "@docs-as-code:";
 
-pub(crate) fn file_marker() -> String {
-    format!("{MARKER_PREFIX} file")
-}
 pub(crate) fn section_start_marker(name: &str) -> String {
     format!("{MARKER_PREFIX} start section \"{name}\"")
 }
@@ -75,9 +81,14 @@ enum OptionKind {
 
 fn option_kind(key: &str) -> Option<OptionKind> {
     Some(match key {
-        "remove-prefix" | "remove-suffix" | "strip-line-prefix" | "remove-lines-starting-with" | "param" => {
-            OptionKind::Text
-        }
+        "remove-prefix"
+        | "remove-suffix"
+        | "strip-line-prefix"
+        | "remove-lines-starting-with"
+        | "remove-text"
+        | "param"
+        | "comment"
+        | "TODO" => OptionKind::Text,
         "unindent-common" | "remove-blank-lines" => OptionKind::Flag,
         "reindent" => OptionKind::Numbers,
         _ => return None,
@@ -92,6 +103,10 @@ impl MarkerOption {
             side,
         }
     }
+    /// A `comment` or `TODO`: for people, not for comparing
+    pub(crate) fn is_note(&self) -> bool {
+        matches!(self.key.as_str(), "comment" | "TODO")
+    }
     pub(crate) fn text_value(&self) -> &str {
         match &self.value {
             Some(OptionValue::Text(text)) => text,
@@ -104,6 +119,7 @@ impl MarkerOption {
         let value = match &self.value {
             None => String::new(),
             Some(OptionValue::Reindent { from, to }) => format!(": {from} -> {to}"),
+            Some(OptionValue::Text(text)) if self.key == "remove-text" => format!(": {}", quote_raw(text)),
             Some(OptionValue::Text(text)) => format!(": {}", quote(text)),
         };
         format!("{side}{}{value}", self.key)
@@ -112,6 +128,25 @@ impl MarkerOption {
 
 fn quote(text: &str) -> String {
     format!("\"{}\"", text.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+/// Quotes a regex the way [`OptionCursor::raw_quoted_value`] reads it back:
+/// backslashes as they are, a bare `"` escaped
+fn quote_raw(regex: &str) -> String {
+    let mut quoted = String::from("\"");
+    let mut characters = regex.chars();
+    while let Some(character) = characters.next() {
+        match character {
+            '\\' => {
+                quoted.push('\\');
+                quoted.extend(characters.next());
+            }
+            '"' => quoted.push_str("\\\""),
+            _ => quoted.push(character),
+        }
+    }
+    quoted.push('"');
+    quoted
 }
 
 /// Reads option text a character at a time
@@ -197,6 +232,34 @@ impl OptionCursor {
         }
     }
 
+    /// `"regex"`, kept as written: `\` and the character after it are both kept
+    /// (so `\"` doesn't end it)
+    fn raw_quoted_value(&mut self, key: &str) -> Result<String> {
+        if !self.eat('"') {
+            bail!("the value of \"{key}\" must be quoted");
+        }
+        let mut value = String::new();
+        loop {
+            match self.peek() {
+                None => bail!("unterminated value for \"{key}\""),
+                Some('"') => {
+                    self.position += 1;
+                    return Ok(value);
+                }
+                Some('\\') => {
+                    value.push('\\');
+                    self.position += 1;
+                    value.push(
+                        self.peek()
+                            .with_context(|| format!("unterminated value for \"{key}\""))?,
+                    );
+                }
+                Some(character) => value.push(character),
+            }
+            self.position += 1;
+        }
+    }
+
     fn number(&mut self) -> Option<usize> {
         self.take_while(|character| character.is_ascii_digit()).parse().ok()
     }
@@ -227,8 +290,8 @@ fn parse_option(cursor: &mut OptionCursor) -> Result<MarkerOption> {
         bail!("expected an option name at \"{}\"", cursor.remaining());
     }
     let kind = option_kind(&key).with_context(|| format!("unknown option \"{key}\""))?;
-    if side == OptionSide::Doc && key == "param" {
-        bail!("\"param\" only applies to the repo side");
+    if side == OptionSide::Doc && matches!(key.as_str(), "param" | "comment" | "TODO") {
+        bail!("\"{key}\" only applies to the repo side");
     }
     cursor.skip_whitespace();
     let value = match kind {
@@ -274,15 +337,26 @@ fn expect_value(cursor: &mut OptionCursor, key: &str) -> Result<()> {
 }
 
 fn parse_text_value(cursor: &mut OptionCursor, key: &str) -> Result<OptionValue> {
-    let value = cursor.quoted_value(key)?;
+    let value = if key == "remove-text" {
+        cursor.raw_quoted_value(key)?
+    } else {
+        cursor.quoted_value(key)?
+    };
     if value.is_empty() {
         bail!("\"{key}\" needs a non-empty value");
+    }
+    if key == "remove-text" {
+        compile_option_regex(key, &value)?;
     }
     cursor.skip_whitespace();
     if key == "param" && cursor.remaining().starts_with("->") {
         bail!("\"param\" takes only the placeholder, e.g. param: \"<NODES_MTU>\"");
     }
     Ok(OptionValue::Text(value))
+}
+
+fn compile_option_regex(key: &str, pattern: &str) -> Result<fancy_regex::Regex> {
+    fancy_regex::Regex::new(pattern).with_context(|| format!("\"{key}\" has an invalid regex \"{pattern}\""))
 }
 
 /// `<from> -> <to>`
@@ -320,11 +394,22 @@ pub(crate) struct MarkedSection {
     pub end_line: usize,
 }
 
+/// A `TODO` on a marker
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct MarkerTodo {
+    /// 1-based line number of the marker line it's on
+    pub line: usize,
+    /// The section whose start marker has it; None on a file marker
+    pub section: Option<String>,
+    pub text: String,
+}
+
 #[derive(Default, Debug)]
 pub(crate) struct Markers {
     pub file: Option<MarkerHeader>,
     pub sections: BTreeMap<String, MarkedSection>,
     pub problems: Vec<String>,
+    pub todos: Vec<MarkerTodo>,
 }
 
 const CONTINUATION_PATTERN: &str = r"^\s*#\s*(\|.*)$";
@@ -410,6 +495,19 @@ pub(crate) fn parse_markers(text: &str) -> Result<Markers> {
             .into_iter()
             .map(|(name, header)| format!("line {}: section \"{name}\" has no end marker", header.first_line)),
     );
+    let todo_line = regex!(r"\|\s*TODO\s*:")?;
+    markers.todos = markers
+        .file
+        .iter()
+        .map(|header| (header, None))
+        .chain(
+            markers
+                .sections
+                .values()
+                .map(|section| (&section.header, Some(section.name.as_str()))),
+        )
+        .flat_map(|(header, section)| header_todos(header, section, &lines, todo_line))
+        .collect();
     if let Some(header) = &markers.file
         && !markers.sections.is_empty()
     {
@@ -419,6 +517,51 @@ pub(crate) fn parse_markers(text: &str) -> Result<Markers> {
         ));
     }
     Ok(markers)
+}
+
+/// A marker's `TODO`s, each on the marker line it's written on
+fn header_todos(header: &MarkerHeader, section: Option<&str>, lines: &[&str], todo_line: &Regex) -> Vec<MarkerTodo> {
+    let todo_lines: Vec<usize> = (header.first_line..=header.last_line)
+        .filter(|line_number| lines.get(line_number - 1).is_some_and(|line| todo_line.is_match(line)))
+        .collect();
+    header
+        .options
+        .iter()
+        .filter(|option| option.key == "TODO")
+        .enumerate()
+        .map(|(todo_index, option)| MarkerTodo {
+            line: todo_lines.get(todo_index).copied().unwrap_or(header.first_line),
+            section: section.map(str::to_owned),
+            text: option.text_value().to_owned(),
+        })
+        .collect()
+}
+
+/// `text` without the markers of its marked code: the file marker (`section`
+/// None) or a section's start and end markers, option lines included
+pub(crate) fn remove_markers(text: &str, section: Option<&str>) -> Result<String> {
+    let markers = parse_markers(text)?;
+    let marker_lines: Vec<usize> = match section {
+        None => {
+            let header = markers.file.as_ref().context("the file isn't marked whole")?;
+            (header.first_line..=header.last_line).collect()
+        }
+        Some(name) => {
+            let section = markers
+                .sections
+                .get(name)
+                .with_context(|| format!("the file has no section \"{name}\""))?;
+            (section.header.first_line..=section.header.last_line)
+                .chain([section.end_line])
+                .collect()
+        }
+    };
+    Ok(text
+        .split_inclusive('\n')
+        .enumerate()
+        .filter(|(line_index, _)| !marker_lines.contains(&(line_index + 1)))
+        .map(|(_, line)| line)
+        .collect())
 }
 
 /// The byte offset each line starts at
@@ -501,19 +644,23 @@ fn record_marker(
     Ok(())
 }
 
-/// What `*` stands for in a wildcard value
-const WILDCARD_NAME_PATTERN: &str = "[A-Za-z0-9_]+";
-
-/// The regex for a value with `*` wildcards; None when it has none
+/// The regex for a value with `*` wildcards; None when it has none. Each `*`
+/// stands for the shortest text without whitespace that the text after it
+/// allows (all of it, at the value's end)
 fn wildcard_regex(value: &str) -> Result<Option<Regex>> {
     if !value.contains('*') {
         return Ok(None);
     }
     let pattern = value
+        .replace("**", "*")
         .split('*')
         .map(regex::escape)
         .collect::<Vec<_>>()
-        .join(WILDCARD_NAME_PATTERN);
+        .join(r"\S+?");
+    let pattern = match pattern.strip_suffix(r"\S+?") {
+        Some(before_last_wildcard) => format!(r"{before_last_wildcard}\S+"),
+        None => pattern,
+    };
     Regex::new(&pattern)
         .map(Some)
         .with_context(|| format!("compiling the pattern for \"{value}\""))
@@ -547,6 +694,7 @@ fn apply_option(lines: Vec<String>, option: &MarkerOption) -> Result<Vec<String>
         "remove-suffix" => remove_suffix(lines, value),
         "strip-line-prefix" => Ok(strip_line_prefix(lines, value)),
         "remove-lines-starting-with" => remove_lines_starting_with(lines, value),
+        "remove-text" => remove_text(&lines, value),
         "remove-blank-lines" => Ok(lines.into_iter().filter(|line| !line.trim().is_empty()).collect()),
         "unindent-common" => unindent_common(&lines),
         "reindent" => match option.value {
@@ -608,6 +756,24 @@ fn remove_lines_starting_with(lines: Vec<String>, line_start: &str) -> Result<Ve
         .collect())
 }
 
+/// Removes every match of `pattern`, which may span lines
+fn remove_text(lines: &[String], pattern: &str) -> Result<Vec<String>> {
+    let regex = compile_option_regex("remove-text", pattern)?;
+    let text = lines.join("\n");
+    if !regex.is_match(&text).context("matching \"remove-text\"")? {
+        bail!("\"remove-text\" doesn't match anything: \"{pattern}\"");
+    }
+    let mut removed = String::new();
+    let mut kept_from = 0;
+    for found in regex.find_iter(&text) {
+        let found = found.context("matching \"remove-text\"")?;
+        removed.push_str(text.get(kept_from..found.start()).unwrap_or_default());
+        kept_from = found.end();
+    }
+    removed.push_str(text.get(kept_from..).unwrap_or_default());
+    Ok(removed.split('\n').map(str::to_owned).collect())
+}
+
 fn unindent_common(lines: &[String]) -> Result<Vec<String>> {
     let common_indentation = lines
         .iter()
@@ -659,7 +825,7 @@ fn check_param_appears(lines: &[String], param: &str) -> Result<()> {
 
 /// Options that change the text (so whitespace fixes can't be worked out on the result)
 pub(crate) fn has_shaping_options(options: &[MarkerOption]) -> bool {
-    options.iter().any(|option| option.key != "param")
+    options.iter().any(|option| option.key != "param" && !option.is_note())
 }
 
 /// The placeholders `param` options declare in `content`: each wildcard
@@ -679,6 +845,19 @@ pub(crate) fn placeholders(options: &[MarkerOption], content: &str) -> Result<Ve
             }
             unique_names
         }))
+}
+
+/// The placeholders whose value may have whitespace: those a `**` wildcard
+/// stands for
+pub(crate) fn spaced_placeholders(options: &[MarkerOption], content: &str) -> Result<SpacedPlaceholders> {
+    let mut spaced = SpacedPlaceholders::new();
+    for option in options
+        .iter()
+        .filter(|option| option.key == "param" && option.text_value().contains("**"))
+    {
+        spaced.extend(param_names(option.text_value(), content)?);
+    }
+    Ok(spaced)
 }
 
 /// The names a `param` value stands for in `content`
@@ -739,6 +918,71 @@ mod tests {
         assert_eq!(content, "a: <X>\nb: <Y> <X>\n");
         assert_eq!(placeholders(&options, &content)?, ["<X>", "<Y>"]);
         assert!(apply_options("no names\n", &parse_options(r#"| param: "<*>""#)?).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn removes_text_by_regex() -> Result<()> {
+        let options = parse_options(r#"| remove-text: " +#.*" | remove-text: "\n\s*// drop\n""#)?;
+        let content = apply_options("a: 1 # note\n  // drop\nb: \"#x\"\n", &options)?;
+        assert_eq!(content, "a: 1b: \"#x\"\n");
+        assert!(apply_options("a\n", &parse_options(r#"| remove-text: "zz""#)?).is_err());
+        assert!(parse_options(r#"| remove-text: "(""#).is_err());
+        let quoted = parse_options(r#"| remove-text: "\"\d+\"""#)?;
+        assert_eq!(quoted[0].text_value(), r#"\"\d+\""#);
+        assert_eq!(parse_options(&format!("| {}", quoted[0].marker_text()))?, quoted);
+        Ok(())
+    }
+
+    #[test]
+    fn double_wildcards_allow_spaced_values() -> Result<()> {
+        let options = parse_options(r#"| param: "${**}" | param: "<*>""#)?;
+        let content = "a: ${A} <B>\nb: ${C}\n";
+        assert_eq!(placeholders(&options, content)?, ["${A}", "${C}", "<B>"]);
+        let spaced = spaced_placeholders(&options, content)?;
+        assert_eq!(spaced, SpacedPlaceholders::from(["${A}".to_owned(), "${C}".to_owned()]));
+        Ok(())
+    }
+
+    #[test]
+    fn notes_change_nothing_and_todos_are_listed() -> Result<()> {
+        let text = "# @docs-as-code: start section \"s\" | comment: \"why | this\"\n#   | TODO: \"use a file\"\n#   | unindent-common | TODO: \"simplify the docs\"\n  a\n# @docs-as-code: end section \"s\"\n";
+        let markers = parse_markers(text)?;
+        assert!(markers.problems.is_empty(), "{:?}", markers.problems);
+        let options = &markers.sections["s"].header.options;
+        assert_eq!(options[0].text_value(), "why | this");
+        assert_eq!(apply_options("  a\n", &options[..2])?, "  a\n");
+        let todos: Vec<_> = markers
+            .todos
+            .iter()
+            .map(|todo| (todo.line, todo.section.as_deref(), todo.text.as_str()))
+            .collect();
+        assert_eq!(
+            todos,
+            [(2, Some("s"), "use a file"), (3, Some("s"), "simplify the docs")]
+        );
+        assert!(parse_options(r#"| doc TODO: "x""#).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn removes_a_section_s_markers() -> Result<()> {
+        let text =
+            "a\n# @docs-as-code: start section \"s\"\n#   | TODO: \"x\"\nb\n# @docs-as-code: end section \"s\"\nc";
+        assert_eq!(remove_markers(text, Some("s"))?, "a\nb\nc");
+        assert!(remove_markers(text, Some("t")).is_err());
+        assert!(remove_markers(text, None).is_err());
+        assert_eq!(remove_markers("# @docs-as-code: file\nx\n", None)?, "x\n");
+        Ok(())
+    }
+
+    #[test]
+    fn wildcards_stand_for_any_text_without_whitespace() -> Result<()> {
+        let options = parse_options(r#"| param: "<*>""#)?;
+        let content = "name: <interface-name> <a>-<b>\n";
+        assert_eq!(placeholders(&options, content)?, ["<interface-name>", "<a>", "<b>"]);
+        let options = parse_options(r#"| remove-lines-starting-with: "--*""#)?;
+        assert_eq!(apply_options("--set-x\nkeep\n", &options)?, "keep\n");
         Ok(())
     }
 

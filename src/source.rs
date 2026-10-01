@@ -4,6 +4,7 @@
 //! just the ref (depth 1), and reads files straight from git objects, fetching
 //! only the blobs it needs. That keeps huge repos cheap.
 
+use crate::progress;
 use anyhow::{Context, Result, anyhow, bail};
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -92,6 +93,59 @@ impl Tree {
             }
             Self::Git(git_tree) => git_tree.list_files(""),
         }
+    }
+
+    /// The files containing `needle` among those `is_wanted` accepts by path,
+    /// with their text. A checkout is searched with `git grep`, over the same
+    /// files `list_files` gives; from git, the wanted files are read.
+    pub(crate) fn files_containing(
+        &self,
+        needle: &str,
+        is_wanted: impl Fn(&str) -> bool,
+    ) -> Result<Vec<(String, String)>> {
+        let paths: Vec<String> = match self {
+            Self::Local(root) => {
+                let grep_args = [
+                    "grep",
+                    "-l",
+                    "-z",
+                    "-I",
+                    "-F",
+                    "--untracked",
+                    "--no-color",
+                    "-e",
+                    needle,
+                ];
+                let output = run_git(root, &grep_args)?;
+                // 1: nothing contains it
+                if !output.status.success() && output.status.code() != Some(1) {
+                    bail!(
+                        "git {} failed: {}",
+                        grep_args.join(" "),
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    );
+                }
+                String::from_utf8_lossy(&output.stdout)
+                    .split('\0')
+                    .filter(|path| !path.is_empty() && is_wanted(path))
+                    .map(str::to_owned)
+                    .collect()
+            }
+            Self::Git(git_tree) => git_tree
+                .list_files("")?
+                .into_iter()
+                .map(|(path, _)| path)
+                .filter(|path| is_wanted(path))
+                .collect(),
+        };
+        let texts = self.read_all(&paths)?;
+        Ok(paths
+            .into_iter()
+            .zip(texts)
+            // Gone, or not text
+            .filter_map(|(path, text)| Some((path, text?)))
+            .filter(|(_, text)| text.contains(needle))
+            .collect())
     }
 
     /// The directory the files are in, when they're on disk (and can be changed)
@@ -278,7 +332,7 @@ impl GitTree {
         let commit = if has_pinned_commit(&clone_dir, reference) {
             reference.to_owned()
         } else {
-            eprintln!("asadoc: fetching {url} at {reference} into {}", clone_dir.display());
+            progress::announce(format!("fetching {url} at {reference} into {}", clone_dir.display()));
             fetch_commit(&clone_dir, url, reference)?
         };
         Ok(Self {
@@ -429,11 +483,11 @@ impl GitTree {
         .into_iter()
         .chain(missing_oids.iter().copied())
         .collect();
-        eprintln!(
-            "asadoc: fetching {} files from {} into the cache",
+        progress::announce(format!(
+            "fetching {} files from {} into the cache",
             missing_oids.len(),
             self.url
-        );
+        ));
         git_stdout(&self.clone_dir, &fetch_args).context("fetching the blobs")?;
         Ok(())
     }

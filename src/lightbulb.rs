@@ -1,12 +1,12 @@
 //! Lightbulbs: simple repo-side changes that make candidate code match a doc
-//! block exactly: marking a file or part of one, adding or removing a leading
+//! block exactly: marking more of a file that has markers as a section, adding or removing a leading
 //! `---` or trailing newlines, and, when the doc's shell prompts are in the
 //! way, adding `doc strip-line-prefix: "$ "` to the marker. Anything more
 //! involved is left to a person or an AI assistant.
 
 use crate::docs::DocBlock;
 use crate::markers::{self, MarkerOption, Markers, OptionSide};
-use crate::matching::match_content;
+use crate::matching::{SpacedPlaceholders, match_content};
 use crate::repo::{MarkedCode, can_hold_markers};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -17,7 +17,6 @@ use std::path::Path;
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "type", rename_all = "kebab-case")]
 pub(crate) enum LightbulbFix {
-    MarkFile,
     MarkSection {
         name: String,
         #[serde(rename = "line")]
@@ -44,11 +43,12 @@ pub(crate) struct LightbulbPlan {
     pub doc_options: Vec<MarkerOption>,
 }
 
-/// What a candidate is: marked code, or an unmarked file
+/// What a candidate is: marked code, or a file with markers whose unmarked
+/// lines could be marked
 pub(crate) struct Candidate<'a> {
     pub file: &'a str,
     pub section: Option<&'a str>,
-    /// Marked code with its options applied; None for an unmarked file
+    /// Marked code with its options applied; None for the file's unmarked lines
     pub marked_code: Option<&'a MarkedCode>,
     pub file_text: &'a str,
     pub markers: &'a Markers,
@@ -103,6 +103,7 @@ fn content_plan(
     prior_fixes: Vec<LightbulbFix>,
     can_normalize: bool,
     placeholders: &[String],
+    spaced_placeholders: &SpacedPlaceholders,
 ) -> Result<Option<Vec<LightbulbFix>>> {
     let (normalized, normalize_fixes) = if can_normalize {
         normalize(doc_code, repo_code)
@@ -112,7 +113,7 @@ fn content_plan(
     if prior_fixes.is_empty() && normalize_fixes.is_empty() {
         return Ok(None);
     }
-    if match_content(&normalized, placeholders, doc_code)
+    if match_content(&normalized, placeholders, spaced_placeholders, doc_code)
         .context("matching the fixed code against the doc")?
         .is_none()
     {
@@ -137,7 +138,7 @@ fn is_comment(line: &str) -> bool {
     line.trim_start().starts_with('#')
 }
 
-/// The doc block as a stretch of lines in an unmarked file: consecutive code
+/// The doc block as a stretch of unmarked lines in a file: consecutive code
 /// lines equal to it, skipping comment lines in between (only when the doc has
 /// no comments of its own). Marking that stretch as a section is the fix.
 fn portion_plan(block: &DocBlock, doc_code: &str, file_text: &str, markers: &Markers) -> Option<Vec<LightbulbFix>> {
@@ -183,20 +184,6 @@ fn portion_plan(block: &DocBlock, doc_code: &str, file_text: &str, markers: &Mar
     }])
 }
 
-/// Marking the whole of an unmarked file, with its content normalized if need be
-fn whole_file_plan(doc_code: &str, file_text: &str) -> Result<Option<Vec<LightbulbFix>>> {
-    // Marked, the file's last line ends with a newline even if the file doesn't
-    let marked_text = if file_text.is_empty() || file_text.ends_with('\n') {
-        file_text.to_owned()
-    } else {
-        format!("{file_text}\n")
-    };
-    if marked_text == doc_code {
-        return Ok(Some(vec![LightbulbFix::MarkFile]));
-    }
-    content_plan(doc_code, &marked_text, vec![LightbulbFix::MarkFile], true, &[])
-}
-
 fn plan_against(block: &DocBlock, doc_code: &str, candidate: &Candidate<'_>) -> Result<Option<Vec<LightbulbFix>>> {
     if let Some(marked_code) = candidate.marked_code {
         return content_plan(
@@ -205,16 +192,12 @@ fn plan_against(block: &DocBlock, doc_code: &str, candidate: &Candidate<'_>) -> 
             vec![],
             !markers::has_shaping_options(&marked_code.options),
             &marked_code.placeholders,
+            &marked_code.spaced_placeholders,
         )
         .context("fixing the marked code");
     }
     if !can_hold_markers(candidate.file) || candidate.markers.file.is_some() {
         return Ok(None);
-    }
-    if candidate.markers.sections.is_empty()
-        && let Some(fixes) = whole_file_plan(doc_code, candidate.file_text).context("marking the whole file")?
-    {
-        return Ok(Some(fixes));
     }
     Ok(portion_plan(block, doc_code, candidate.file_text, candidate.markers))
 }
@@ -294,10 +277,6 @@ fn describe_fix(fix: &LightbulbFix, file: &str, section: Option<&str>) -> Vec<St
         None => "the file".to_owned(),
     };
     match fix {
-        LightbulbFix::MarkFile => vec![format!(
-            "add a `# {}` line at the top of {file}, marking the whole file",
-            markers::file_marker()
-        )],
         LightbulbFix::MarkSection {
             name,
             first_line,
@@ -426,22 +405,6 @@ fn extend_marker(text: &str, section: Option<&str>, options: &[MarkerOption]) ->
     ))
 }
 
-/// Adds a file marker (with the doc options) at the top of `text`, after any shebang line
-fn mark_file(text: &str, doc_options: &[MarkerOption]) -> Result<String> {
-    let marker_offset = if text.starts_with("#!") {
-        text.find('\n').map_or(text.len(), |newline_offset| newline_offset + 1)
-    } else {
-        0
-    };
-    let marker_lines = format!(
-        "# {}\n{}",
-        markers::file_marker(),
-        markers::continuation_lines("", doc_options)
-    );
-    let (before, after) = split_at_byte(text, marker_offset).context("placing the file marker")?;
-    Ok(format!("{before}{marker_lines}{after}"))
-}
-
 /// Surrounds the `line_count` lines from (1-based) `first_line` with markers making them section `section_name`
 fn mark_section(
     text: &str,
@@ -494,7 +457,6 @@ fn mark_section(
 /// Applies one fix to `text`, in `section` (if any)
 fn apply_fix(text: &str, section: Option<&str>, fix: &LightbulbFix, doc_options: &[MarkerOption]) -> Result<String> {
     match fix {
-        LightbulbFix::MarkFile => mark_file(text, doc_options).context("marking the file"),
         LightbulbFix::MarkSection {
             name,
             first_line,
@@ -532,7 +494,7 @@ pub(crate) fn apply(file_path: &Path, section: Option<&str>, plan: &LightbulbPla
     let options_placed = plan
         .fixes
         .iter()
-        .any(|fix| matches!(fix, LightbulbFix::MarkFile | LightbulbFix::MarkSection { .. }));
+        .any(|fix| matches!(fix, LightbulbFix::MarkSection { .. }));
     let final_text = if !plan.doc_options.is_empty() && !options_placed {
         extend_marker(&fixed_text, final_section.as_deref(), &plan.doc_options).context("adding the doc options")?
     } else {

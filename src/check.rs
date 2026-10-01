@@ -8,7 +8,7 @@ use similar::TextDiff;
 
 use crate::config::AsadocConfig;
 use crate::eval::Evaluation;
-use crate::repo::MarkerProblem;
+use crate::repo::{self, MarkerProblem};
 use crate::report::{
     self, CheckOutcome, CheckSummary, Closest, FixOutcome, LineDiff, Sides, UnresolvedInAssembly, UnusedCode,
 };
@@ -37,10 +37,6 @@ fn describe_line_diff(line_diff: LineDiff) -> String {
 fn describe_closest(closest_code: &Closest) -> String {
     match closest_code {
         Closest::Marked { name, line_diff } => format!("{name} (marked; {})", describe_line_diff(*line_diff)),
-        Closest::UnmarkedFile { file, line_diff } => format!(
-            "{file} (not marked; {} of the block's {} lines aren't in it)",
-            line_diff.differing_lines, line_diff.doc_line_count
-        ),
         Closest::Lines {
             file,
             first_line,
@@ -177,6 +173,15 @@ fn print_problems(problems: &[MarkerProblem]) {
     for problem in problems {
         println!("  ! {}: {}", problem.file, problem.message);
     }
+}
+
+/// `asadoc todo`: every `TODO` on this repo's markers
+pub(crate) fn list_todos(config: &AsadocConfig) -> Result<bool> {
+    let scan = repo::scan(config).context("scanning the code for markers")?;
+    for todo in &scan.todos {
+        println!("{}:{}: {}", todo.file, todo.line, todo.text);
+    }
+    Ok(true)
 }
 
 /// The all-clear, or what to do next

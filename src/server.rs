@@ -7,9 +7,10 @@ use crate::docs;
 use crate::eval::{self, AssemblyEval, BlockEval, CandidateInfo, Evaluation, FormerIgnoredEntry};
 use crate::ignored::{IgnoreReason, IgnoredBlocks};
 use crate::lightbulb;
-use crate::markers::MarkerOption;
+use crate::markers::{self, MarkerOption};
 use crate::matching::PlaceholderValues;
-use crate::repo::{MarkedCode, MarkerProblem};
+use crate::progress;
+use crate::repo::{MarkedCode, MarkerProblem, Todo};
 use anyhow::{Context, Result, anyhow};
 use axum::Router;
 use axum::extract::{Query, State};
@@ -17,16 +18,18 @@ use axum::http::{StatusCode, header};
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Json, Response};
 use axum::routing::{get, post};
-use notify::{RecommendedWatcher, RecursiveMode, Watcher, recommended_watcher};
+use notify::event::{AccessKind, AccessMode};
+use notify::{EventKind, RecommendedWatcher, RecursiveMode, Watcher, recommended_watcher};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use std::convert::Infallible;
 use std::path::{Component, Path};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, PoisonError};
+use std::time::{Duration, Instant};
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::{Notify, broadcast, mpsc, watch};
 use tokio::task;
 use tokio::time::timeout;
 use tokio_stream::StreamExt;
@@ -38,40 +41,205 @@ const APP_CSS: &str = include_str!("../ui/app.css");
 const GUIDE_MARKDOWN: &str = include_str!("../GUIDE.md");
 
 struct AppState {
-    config: AsadocConfig,
+    /// Set once the config is loaded; until the first evaluation is done too,
+    /// the API answers 503 and the page shows `preparation`
+    config: OnceLock<AsadocConfig>,
+    preparation: Mutex<Preparation>,
+    /// Tells open pages there's a new evaluation
     change_sender: broadcast::Sender<()>,
+    /// Kept for as long as the server runs, once there's a config to watch
+    watcher: Mutex<Option<RecommendedWatcher>>,
+    /// Counts the changes made to the repos (seen by the watcher, or made by
+    /// an action), so an evaluation knows whether it's current
+    changes_seen: AtomicU64,
+    /// Wakes the evaluator when `changes_seen` goes up
+    evaluation_needed: Notify,
+    /// The latest evaluation, kept current in the background
+    latest: watch::Sender<Option<Arc<LatestEvaluation>>>,
 }
 
 type SharedState = Arc<AppState>;
 
-pub(crate) fn serve(config: AsadocConfig, port: u16) -> Result<()> {
-    // Bound first so a taken port fails right away, not after the warm-up
+enum Preparation {
+    Preparing { since: Instant },
+    Ready,
+    Failed(String),
+}
+
+/// An evaluation of the repos as they were after `changes_seen` changes
+struct LatestEvaluation {
+    changes_seen: u64,
+    /// The evaluation and the report built from it, or why that failed
+    outcome: Result<(Evaluation, ReportData), String>,
+}
+
+impl AppState {
+    fn set_preparation(&self, preparation: Preparation) {
+        *self.preparation.lock().unwrap_or_else(PoisonError::into_inner) = preparation;
+    }
+
+    /// The config, once the review UI is ready; a 503 before
+    fn config(&self) -> ApiResult<&AsadocConfig> {
+        self.config
+            .get()
+            .ok_or_else(|| anyhow!("the review UI isn't ready yet"))
+            .status(StatusCode::SERVICE_UNAVAILABLE)
+    }
+
+    /// Notes a change to the repos, for the evaluator to catch up with
+    fn mark_changed(&self) {
+        self.changes_seen.fetch_add(1, Ordering::SeqCst);
+        self.evaluation_needed.notify_one();
+    }
+
+    /// The evaluation of the repos as they are now: the latest one, after
+    /// waiting for the evaluator when a change came after it
+    async fn current_evaluation(&self) -> ApiResult<Arc<LatestEvaluation>> {
+        self.config()?;
+        let mut latest = self.latest.subscribe();
+        let current = latest
+            .wait_for(|latest| {
+                latest
+                    .as_ref()
+                    .is_some_and(|latest| latest.changes_seen == self.changes_seen.load(Ordering::SeqCst))
+            })
+            .await
+            .context("waiting for the evaluation")?
+            .clone()
+            .context("no evaluation yet")?;
+        Ok(current)
+    }
+}
+
+impl LatestEvaluation {
+    fn evaluated(&self) -> ApiResult<(&Evaluation, &ReportData)> {
+        self.outcome
+            .as_ref()
+            .map(|(evaluation, report)| (evaluation, report))
+            .map_err(|error| anyhow!("{error}").into())
+    }
+}
+
+/// Serves right away, so a page opened early says what asadoc is busy with,
+/// then loads the config and evaluates in the background, and again whenever
+/// the repos change
+pub(crate) fn serve(load_config: impl FnOnce() -> Result<AsadocConfig> + Send + 'static, port: u16) -> Result<()> {
     let std_listener =
         std::net::TcpListener::bind(("127.0.0.1", port)).with_context(|| format!("listening on port {port}"))?;
     std_listener
         .set_nonblocking(true)
         .context("making the listener non-blocking")?;
-    println!("asadoc: preparing the review UI...");
-    warm_up(&config).context("preparing the review UI")?;
     let runtime = Runtime::new().context("starting the async runtime")?;
     runtime.block_on(async move {
         let (change_sender, _) = broadcast::channel(16);
-        let state = Arc::new(AppState { config, change_sender });
-        let _watcher = watch_repos(Arc::clone(&state)).context("watching the repos for changes")?;
+        let state = Arc::new(AppState {
+            config: OnceLock::new(),
+            preparation: Mutex::new(Preparation::Preparing { since: Instant::now() }),
+            change_sender,
+            watcher: Mutex::new(None),
+            changes_seen: AtomicU64::new(0),
+            evaluation_needed: Notify::new(),
+            latest: watch::Sender::new(None),
+        });
         let listener = TcpListener::from_std(std_listener).context("setting up the listener")?;
-        println!("asadoc: review UI at http://localhost:{port}");
+        println!("asadoc: review UI at http://localhost:{port} (preparing it...)");
+        tokio::spawn(prepare(Arc::clone(&state), load_config));
         axum::serve(listener, router(state)).await.context("serving HTTP")?;
         anyhow::Ok(())
     })
 }
 
-/// Does up front what the first page load would: an evaluation, and reading
-/// the attributes modules render with. With docs from git, that fetches every
-/// file the UI needs into the cache, so the page opens without waiting on it
+/// Loads the config, warms up, starts watching the repos and evaluates them,
+/// then keeps the evaluation current. A failure to get that far is shown on
+/// the page (and in the terminal) until asadoc is restarted.
+async fn prepare(state: SharedState, load_config: impl FnOnce() -> Result<AsadocConfig> + Send + 'static) {
+    let preparing_state = Arc::clone(&state);
+    let prepared = task::spawn_blocking(move || {
+        let state = preparing_state;
+        progress::step("loading the config");
+        let config = load_config()?;
+        // Watching before evaluating, so a change made meanwhile gets evaluated too
+        let watcher = watch_repos(&config, Arc::clone(&state)).context("watching the repos for changes")?;
+        *state.watcher.lock().unwrap_or_else(PoisonError::into_inner) = Some(watcher);
+        warm_up(&config).context("preparing the review UI")?;
+        state
+            .config
+            .set(config)
+            .map_err(|_already_set| anyhow!("the review UI was prepared twice"))?;
+        let first_evaluation = evaluate_now(&state)?;
+        if let Err(error) = &first_evaluation.outcome {
+            return Err(anyhow!("{error}"));
+        }
+        state.latest.send_replace(Some(first_evaluation));
+        anyhow::Ok(())
+    })
+    .await
+    .context("preparing the review UI")
+    .and_then(|prepared| prepared);
+    match prepared {
+        Ok(()) => {
+            println!("asadoc: the review UI is ready");
+            state.set_preparation(Preparation::Ready);
+            keep_evaluating(state).await;
+        }
+        Err(error) => {
+            let message = format!("{error:#}");
+            eprintln!("asadoc: {message}");
+            state.set_preparation(Preparation::Failed(message));
+        }
+    }
+}
+
+/// Evaluates the repos as they are now (blocking)
+fn evaluate_now(state: &AppState) -> Result<Arc<LatestEvaluation>> {
+    let config = state.config.get().context("evaluating before the config is loaded")?;
+    let changes_seen = state.changes_seen.load(Ordering::SeqCst);
+    let outcome = eval::evaluate(config, true)
+        .context("evaluating the doc blocks")
+        .and_then(|evaluation| {
+            progress::step("building the report");
+            let report = build_report(config, &evaluation).context("building the report")?;
+            Ok((evaluation, report))
+        })
+        .map_err(|error| format!("{error:#}"));
+    Ok(Arc::new(LatestEvaluation { changes_seen, outcome }))
+}
+
+/// Re-evaluates whenever the repos change, then tells open pages
+async fn keep_evaluating(state: SharedState) {
+    loop {
+        let is_current = state
+            .latest
+            .borrow()
+            .as_ref()
+            .is_some_and(|latest| latest.changes_seen == state.changes_seen.load(Ordering::SeqCst));
+        if is_current {
+            state.evaluation_needed.notified().await;
+            continue;
+        }
+        let evaluating_state = Arc::clone(&state);
+        match task::spawn_blocking(move || evaluate_now(&evaluating_state)).await {
+            Ok(Ok(latest)) => {
+                if let Err(error) = &latest.outcome {
+                    eprintln!("asadoc: {error}");
+                }
+                state.latest.send_replace(Some(latest));
+                // Fails only when no page is listening
+                state.change_sender.send(()).ok();
+            }
+            Ok(Err(error)) => eprintln!("asadoc: {error:#}"),
+            Err(error) => eprintln!("asadoc: evaluating: {error}"),
+        }
+    }
+}
+
+/// Fetches up front what pages need besides the evaluation: the attributes
+/// modules render with. With docs from git, that fetches the files into the
+/// cache, so a page opens without waiting on it
 fn warm_up(config: &AsadocConfig) -> Result<()> {
-    eval::evaluate(config, true).context("evaluating the doc blocks")?;
     for docs in &config.docs {
         for assembly_path in &docs.assemblies {
+            progress::step(format!("reading the attributes of {}", docs.qualify(assembly_path)));
             docs::assembly_attributes(&docs.source, assembly_path)
                 .with_context(|| format!("reading the attributes of {}", docs.qualify(assembly_path)))?;
         }
@@ -97,11 +265,13 @@ fn router(state: SharedState) -> Router {
             "/guide",
             get(|| async { ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], GUIDE_MARKDOWN) }),
         )
+        .route("/api/status", get(serve_status))
         .route("/api/data", get(serve_data))
         .route("/api/module", get(serve_module))
         .route("/api/file", get(serve_file))
         .route("/api/events", get(serve_events))
         .route("/api/fix", post(apply_fix))
+        .route("/api/remove-markers", post(remove_code_markers))
         .route("/api/ignore", post(ignore_block))
         .route("/api/unignore", post(unignore_block))
         .route("/api/remove-ignored", post(remove_ignored_content))
@@ -112,7 +282,7 @@ fn router(state: SharedState) -> Router {
 // Live updates: tell open pages when either repo changes
 // ---------------------------------------------------------------------------
 
-fn watch_repos(state: SharedState) -> Result<RecommendedWatcher> {
+fn watch_repos(config: &AsadocConfig, state: SharedState) -> Result<RecommendedWatcher> {
     let (raw_changes_sender, raw_changes) = mpsc::unbounded_channel::<()>();
     let mut watcher = recommended_watcher(move |event: notify::Result<notify::Event>| {
         let event = match event {
@@ -122,15 +292,16 @@ fn watch_repos(state: SharedState) -> Result<RecommendedWatcher> {
                 return;
             }
         };
-        if event.paths.iter().any(|path| !is_generated(path)) {
+        // Reads (asadoc's own, while evaluating, included) change nothing
+        let is_read = matches!(event.kind, EventKind::Access(access) if access != AccessKind::Close(AccessMode::Write));
+        if !is_read && event.paths.iter().any(|path| !is_generated(path)) {
             // Fails only once the debouncer is gone, as the server shuts down
             raw_changes_sender.send(()).ok();
         }
     })
     .context("creating the file watcher")?;
     // Code and docs from git are fixed at the fetched commit
-    for code_root in state
-        .config
+    for code_root in config
         .code
         .iter()
         .filter_map(|code_source| code_source.tree.local_root())
@@ -139,12 +310,7 @@ fn watch_repos(state: SharedState) -> Result<RecommendedWatcher> {
             .watch(code_root, RecursiveMode::Recursive)
             .with_context(|| format!("watching {}", code_root.display()))?;
     }
-    for modules_dir in state
-        .config
-        .docs
-        .iter()
-        .filter_map(|docs| docs.source.local_modules_dir())
-    {
+    for modules_dir in config.docs.iter().filter_map(|docs| docs.source.local_modules_dir()) {
         watcher
             .watch(&modules_dir, RecursiveMode::NonRecursive)
             .with_context(|| format!("watching {}", modules_dir.display()))?;
@@ -166,9 +332,25 @@ async fn debounce_changes(mut raw_changes: mpsc::UnboundedReceiver<()>, state: S
             .await
             .is_ok_and(|received| received.is_some())
         {}
-        // Fails only when no page is listening
-        state.change_sender.send(()).ok();
+        // Open pages hear of it once it's evaluated
+        state.mark_changed();
     }
+}
+
+/// Whether the review UI is ready; while it's being prepared, what asadoc is
+/// busy with and for how long
+async fn serve_status(State(state): State<SharedState>) -> Json<serde_json::Value> {
+    Json(
+        match &*state.preparation.lock().unwrap_or_else(PoisonError::into_inner) {
+            Preparation::Preparing { since } => json!({
+                "state": "preparing",
+                "step": progress::current_step(),
+                "seconds": since.elapsed().as_secs(),
+            }),
+            Preparation::Ready => json!({ "state": "ready" }),
+            Preparation::Failed(error) => json!({ "state": "failed", "error": error }),
+        },
+    )
 }
 
 async fn serve_events(State(state): State<SharedState>) -> impl IntoResponse {
@@ -255,8 +437,8 @@ struct BlockData {
 struct GuideData {
     id: String,
     title: String,
-    /// The name of its docs source, when there are several
-    docs_name: Option<String>,
+    /// The name of its docs source
+    docs_name: String,
     /// Where its docs are, for people
     docs_location: String,
     blocks: Vec<BlockData>,
@@ -303,6 +485,7 @@ struct ReportData {
     #[serde(rename = "code")]
     marked_code: Vec<CodeData>,
     problems: Vec<MarkerProblem>,
+    todos: Vec<Todo>,
 }
 
 /// Each marked code, with the blocks that match or resemble it
@@ -385,6 +568,7 @@ fn build_report(config: &AsadocConfig, evaluation: &Evaluation) -> Result<Report
         ignore_reasons: evaluation.ignore_reasons.clone(),
         marked_code: code_data(config, evaluation),
         problems: evaluation.scan.problems.clone(),
+        todos: evaluation.scan.todos.clone(),
     })
 }
 
@@ -506,24 +690,27 @@ impl<T> WithStatus<T> for Result<T> {
 
 type ApiResult<T = Response> = Result<T, ApiError>;
 
+/// Runs an action on the current evaluation; it changes the repos, so the
+/// evaluation that follows waits for re-evaluating
 async fn with_evaluation<T: Send + 'static>(
     state: &SharedState,
-    respond: impl FnOnce(&AsadocConfig, Evaluation) -> ApiResult<T> + Send + 'static,
+    act: impl FnOnce(&AsadocConfig, &Evaluation) -> ApiResult<T> + Send + 'static,
 ) -> ApiResult<T> {
-    let state = Arc::clone(state);
-    task::spawn_blocking(move || {
-        let evaluation = eval::evaluate(&state.config, true).context("evaluating the doc blocks")?;
-        respond(&state.config, evaluation)
+    let latest = state.current_evaluation().await?;
+    let acting_state = Arc::clone(state);
+    let outcome = task::spawn_blocking(move || {
+        let (evaluation, _) = latest.evaluated()?;
+        act(acting_state.config()?, evaluation)
     })
     .await
-    .context("running the evaluation")?
+    .context("running the action")?;
+    state.mark_changed();
+    outcome
 }
 
 async fn serve_data(State(state): State<SharedState>) -> ApiResult {
-    let report = with_evaluation(&state, |config, evaluation| {
-        Ok(build_report(config, &evaluation).context("building the report")?)
-    })
-    .await?;
+    let latest = state.current_evaluation().await?;
+    let (_, report) = latest.evaluated()?;
     Ok(Json(report).into_response())
 }
 
@@ -536,7 +723,7 @@ struct ModuleQuery {
 
 /// A module's text and the attributes it needs, for rendering in the browser
 async fn serve_module(State(state): State<SharedState>, Query(module_query): Query<ModuleQuery>) -> ApiResult {
-    let (docs, assembly_path) = find_assembly(&state.config, &module_query.assembly_id)
+    let (docs, assembly_path) = find_assembly(state.config()?, &module_query.assembly_id)
         .context("finding the assembly")?
         .with_context(|| format!("no assembly {}", module_query.assembly_id))
         .status(StatusCode::NOT_FOUND)?;
@@ -583,7 +770,7 @@ struct FileQuery {
 /// A code file's text, by its name among all the code sources; only plain
 /// relative paths inside a source
 async fn serve_file(State(state): State<SharedState>, Query(file_query): Query<FileQuery>) -> ApiResult {
-    let (code_source, path) = state.config.code_file(&file_query.path)?;
+    let (code_source, path) = state.config()?.code_file(&file_query.path)?;
     let is_plain_relative = Path::new(path)
         .components()
         .all(|component| matches!(component, Component::Normal(_)));
@@ -600,7 +787,7 @@ async fn serve_file(State(state): State<SharedState>, Query(file_query): Query<F
 }
 
 // ---------------------------------------------------------------------------
-// Actions (each re-evaluates first, so it acts on the current state of both repos)
+// Actions (each on the current evaluation, so it acts on the current state of both repos)
 // ---------------------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -636,7 +823,7 @@ fn find_block<'evaluation>(
 
 async fn apply_fix(State(state): State<SharedState>, Json(action): Json<BlockAction>) -> ApiResult {
     with_evaluation(&state, move |config, evaluation| {
-        let block = find_block(&evaluation, &action)?;
+        let block = find_block(evaluation, &action)?;
         let candidate_id = action.candidate_id.unwrap_or_default();
         let (candidate, fix_plan) = block
             .candidates
@@ -651,6 +838,36 @@ async fn apply_fix(State(state): State<SharedState>, Json(action): Json<BlockAct
         lightbulb::apply(&file_path, candidate.section_name.as_deref(), fix_plan)
             .with_context(|| format!("applying the fix to {candidate_id}"))?;
         println!("Fixed {candidate_id} for {}", action.reference);
+        Ok(success_response())
+    })
+    .await
+}
+
+#[derive(Deserialize)]
+struct CodeAction {
+    /// The marked code's id (`file` or `file#section`)
+    id: String,
+}
+
+/// Removes the markers of a piece of marked code, leaving its code as it is
+async fn remove_code_markers(State(state): State<SharedState>, Json(action): Json<CodeAction>) -> ApiResult {
+    with_evaluation(&state, move |config, evaluation| {
+        let marked_code = evaluation
+            .scan
+            .marked
+            .iter()
+            .find(|marked_code| marked_code.id == action.id)
+            .with_context(|| format!("{} isn't marked anymore", action.id))
+            .status(StatusCode::CONFLICT)?;
+        let file_path = config
+            .writable_code_file(&marked_code.file)
+            .status(StatusCode::CONFLICT)?;
+        let text = std::fs::read_to_string(&file_path).with_context(|| format!("reading {}", file_path.display()))?;
+        let unmarked = markers::remove_markers(&text, marked_code.section.as_deref())
+            .with_context(|| format!("removing the markers of {}", action.id))
+            .status(StatusCode::CONFLICT)?;
+        std::fs::write(&file_path, unmarked).with_context(|| format!("writing {}", file_path.display()))?;
+        println!("Removed the markers of {}", action.id);
         Ok(success_response())
     })
     .await
@@ -677,7 +894,7 @@ async fn ignore_block(State(state): State<SharedState>, Json(action): Json<Block
             };
             return Err(anyhow!("the reason {reason:?} {problem}")).status(StatusCode::BAD_REQUEST);
         }
-        let block = find_block(&evaluation, &action)?;
+        let block = find_block(evaluation, &action)?;
         update_ignored(config, |ignored_blocks| {
             if let Some(description) = &action.new_reason_description {
                 ignored_blocks
@@ -722,9 +939,10 @@ async fn remove_ignored_content(
     State(state): State<SharedState>,
     Json(request): Json<RemoveIgnoredRequest>,
 ) -> ApiResult {
-    update_ignored(&state.config, |ignored_blocks| {
+    update_ignored(state.config()?, |ignored_blocks| {
         ignored_blocks.unignore(&request.content)
     })
     .context("removing ignored content")?;
+    state.mark_changed();
     Ok(success_response())
 }

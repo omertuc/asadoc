@@ -56,10 +56,6 @@ pub(crate) enum Closest {
         name: String,
         line_diff: LineDiff,
     },
-    UnmarkedFile {
-        file: String,
-        line_diff: LineDiff,
-    },
     /// Lines of a file that, marked as a section, would match
     Lines {
         file: String,
@@ -149,10 +145,6 @@ fn block_location(block_eval: &BlockEval) -> String {
 
 fn closest_from_candidate(candidate: &CandidateInfo) -> Closest {
     match candidate.kind {
-        "unmarked-file" => Closest::UnmarkedFile {
-            file: candidate.file.clone(),
-            line_diff: LineDiff::new(&candidate.block_side, &candidate.content),
-        },
         "lines" => {
             let (first_line, last_line) = candidate.line_range.unwrap_or_default();
             Closest::Lines {
@@ -423,7 +415,7 @@ fn find_against_code<'a>(evaluation: &'a Evaluation, code_arg: &str) -> Result<&
 
 /// What checking the block, or all the marked code, a name refers to found
 fn name_outcomes(evaluation: &Evaluation, name: &str, against_code: Option<&MarkedCode>) -> Result<Vec<CheckOutcome>> {
-    if let Some(block_eval) = evaluation.find_named(name)? {
+    if let Some(block_eval) = evaluation.find_named(name) {
         let outcome = match against_code {
             Some(marked_code) => block_outcome_against(evaluation, block_eval, marked_code)
                 .with_context(|| format!("checking {name} against {}", describe_code(marked_code)))?,
@@ -575,7 +567,7 @@ impl FixOutcome {
 pub(crate) fn fix(config: &AsadocConfig, name: &str) -> Result<FixOutcome> {
     let evaluation = eval::evaluate(config, true).context("evaluating the doc blocks")?;
     let block_eval = evaluation
-        .find_named(name)?
+        .find_named(name)
         .with_context(|| format!("no doc block {name} in the configured assemblies"))?;
     let reference = block_eval.block.reference.as_str();
     if block_eval.done() {

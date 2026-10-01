@@ -12,6 +12,7 @@ use crate::ignored::{IgnoreReason, IgnoredBlocks};
 use crate::lightbulb::{self, Candidate, LightbulbFix, LightbulbPlan};
 use crate::markers::{self, MarkerOption};
 use crate::matching::PlaceholderValues;
+use crate::progress;
 use crate::repo::{self, MarkedCode, RepoFile, RepoScan};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
@@ -31,7 +32,7 @@ pub(crate) struct CodeMatch {
 #[serde(rename_all = "camelCase")]
 pub(crate) struct CandidateInfo {
     pub id: String,
-    /// section, file (marked), lines (would become a section), unmarked-file
+    /// section, file (marked), lines (would become a section)
     pub kind: &'static str,
     pub file: String,
     #[serde(rename = "name")]
@@ -45,7 +46,7 @@ pub(crate) struct CandidateInfo {
     pub plan: Option<LightbulbPlan>,
     pub similarity: f64,
     /// What the block is compared with: the code (placeholders filled in where
-    /// possible), the would-be section, or the whole unmarked file
+    /// possible), or the would-be section
     pub content: String,
     /// The doc side it's compared with (doc options applied)
     #[serde(rename = "doc")]
@@ -103,35 +104,11 @@ impl Evaluation {
                 .map(move |block_eval| (assembly_eval, block_eval))
         })
     }
-    /// The block a command-line name refers to: its reference, or, when it's
-    /// unambiguous, its reference without the docs name (`<module>/<language>-<NNN>`)
-    pub(crate) fn find_named(&self, name: &str) -> Result<Option<&BlockEval>> {
-        if let Some((_, block_eval)) = self.blocks().find(|(_, block_eval)| block_eval.block.reference == name) {
-            return Ok(Some(block_eval));
-        }
-        let mut references: Vec<&str> = self
-            .blocks()
-            .map(|(_, block_eval)| block_eval.block.reference.as_str())
-            .filter(|reference| {
-                reference
-                    .split_once(':')
-                    .is_some_and(|(_, unqualified)| unqualified == name)
-            })
-            .collect();
-        // A module in several assemblies is there once for each
-        references.sort_unstable();
-        references.dedup();
-        match references.as_slice() {
-            [] => Ok(None),
-            [reference] => Ok(self
-                .blocks()
-                .find(|(_, block_eval)| block_eval.block.reference == *reference)
-                .map(|(_, block_eval)| block_eval)),
-            _ => bail!(
-                "{name} is in several docs sources; name one of {}",
-                references.join(", ")
-            ),
-        }
+    /// The block a command-line name refers to: the one with that reference
+    pub(crate) fn find_named(&self, name: &str) -> Option<&BlockEval> {
+        self.blocks()
+            .find(|(_, block_eval)| block_eval.block.reference == name)
+            .map(|(_, block_eval)| block_eval)
     }
     pub(crate) fn find(&self, assembly_id: &str, reference: &str) -> Option<&BlockEval> {
         self.blocks()
@@ -301,13 +278,17 @@ fn doc_side(block: &DocBlock, doc_options: &[MarkerOption]) -> Option<String> {
 }
 
 pub(crate) fn evaluate(config: &AsadocConfig, with_candidates: bool) -> Result<Evaluation> {
+    progress::step("scanning the code for marked code");
     let scan = repo::scan(config).context("scanning the repo for marked code")?;
+    progress::step("loading the ignore directories");
     let ignored_blocks = IgnoredBlocks::load_all(config).context("loading the ignore directories")?;
 
+    progress::step("reading the docs");
     let mut assemblies = read_assemblies(config)?
         .into_iter()
         .map(|assembly| {
             let assembly_id = assembly.id.clone();
+            progress::step(format!("comparing the code blocks of {assembly_id} with the code"));
             evaluate_assembly(config, assembly, &scan, &ignored_blocks)
                 .with_context(|| format!("evaluating the assembly {assembly_id}"))
         })
@@ -317,8 +298,9 @@ pub(crate) fn evaluate(config: &AsadocConfig, with_candidates: bool) -> Result<E
     let unused_marked_indexes = unused_code(&assemblies, &scan);
 
     if with_candidates {
+        progress::step("tokenizing the marked code");
         add_candidates(config, &mut assemblies, &scan, &stale_ignored)
-            .context("finding code like the blocks to resolve")?;
+            .context("suggesting matches for the unresolved blocks")?;
     }
 
     Ok(Evaluation {
@@ -486,12 +468,16 @@ fn add_candidates(
     scan: &RepoScan,
     stale_ignored: &[(String, String)],
 ) -> Result<()> {
-    let pool_entries = candidate_pool(config, scan).context("tokenizing the repo code")?;
+    let pool_entries = candidate_pool(config, scan).context("tokenizing the marked code")?;
     assemblies
         .iter_mut()
         .flat_map(|assembly_eval| &mut assembly_eval.blocks)
         .filter(|block_eval| !block_eval.done())
         .try_for_each(|block_eval| {
+            progress::step(format!(
+                "comparing {} with the marked code, to suggest matches",
+                block_eval.block.reference
+            ));
             block_eval.candidates = candidates_for(&block_eval.block, &pool_entries)
                 .with_context(|| format!("finding code resembling {}", block_eval.block.reference))?;
             block_eval.former_ignored_entries = former_ignored_entry(&block_eval.block, stale_ignored)
@@ -533,7 +519,8 @@ struct CandidatePoolEntry<'a> {
     is_writable: bool,
 }
 
-/// All marked code (in a scanned file), then every unmarked file
+/// All marked code, then the files with markers but no file marker (where
+/// more of the file could be marked as a section)
 fn candidate_pool<'a>(config: &AsadocConfig, scan: &'a RepoScan) -> Result<Vec<CandidatePoolEntry<'a>>> {
     let files_by_path: HashMap<&str, &RepoFile> = scan
         .files
@@ -544,12 +531,12 @@ fn candidate_pool<'a>(config: &AsadocConfig, scan: &'a RepoScan) -> Result<Vec<C
         .marked
         .iter()
         .filter_map(|code| Some(marked_pool_entry(config, code, files_by_path.get(code.file.as_str())?)));
-    let unmarked_entries = scan
+    let partly_marked_entries = scan
         .files
         .iter()
         .filter(|repo_file| repo_file.markers.file.is_none())
-        .map(|repo_file| unmarked_pool_entry(config, repo_file));
-    marked_entries.chain(unmarked_entries).collect()
+        .map(|repo_file| partly_marked_pool_entry(config, repo_file));
+    marked_entries.chain(partly_marked_entries).collect()
 }
 
 fn is_writable_source(config: &AsadocConfig, source_index: usize) -> bool {
@@ -578,7 +565,7 @@ fn marked_pool_entry<'a>(
     })
 }
 
-fn unmarked_pool_entry<'a>(config: &AsadocConfig, repo_file: &'a RepoFile) -> Result<CandidatePoolEntry<'a>> {
+fn partly_marked_pool_entry<'a>(config: &AsadocConfig, repo_file: &'a RepoFile) -> Result<CandidatePoolEntry<'a>> {
     Ok(CandidatePoolEntry {
         is_writable: is_writable_source(config, repo_file.source_index),
         id: repo_file.path.clone(),
@@ -636,6 +623,10 @@ fn score_candidate(
         None
     };
     let code = pool_entry.candidate.marked_code;
+    // A file's unmarked lines are only worth showing as a section to mark
+    if code.is_none() && plan.is_none() {
+        return Ok(None);
+    }
     let doc_options = candidate_doc_options(code, plan.as_ref());
     let block_side = doc_side(block, &doc_options).unwrap_or_else(|| block.content.clone());
     let section_to_mark = plan.as_ref().and_then(section_to_mark);
@@ -687,8 +678,8 @@ fn section_to_mark(plan: &LightbulbPlan) -> Option<(usize, usize)> {
     })
 }
 
-/// What the block is compared with: the would-be section, the code with its
-/// placeholders filled in, or the whole unmarked file
+/// What the block is compared with: the would-be section, or the code with its
+/// placeholders filled in
 fn candidate_content(
     candidate: &Candidate<'_>,
     section_to_mark: Option<(usize, usize)>,
@@ -709,7 +700,7 @@ fn candidate_content(
             .matcher
             .fill(block_side)
             .with_context(|| format!("filling in the placeholders of {}", code.id))?,
-        (None, None) => candidate.file_text.to_owned(),
+        (None, None) => bail!("{} has nothing marked or to mark", candidate.file),
     })
 }
 
@@ -717,7 +708,6 @@ const fn candidate_kind(section_to_mark: Option<(usize, usize)>, code: Option<&M
     match (section_to_mark, code) {
         (Some(_), _) => "lines",
         (None, Some(code)) if code.section.is_some() => "section",
-        (None, Some(_)) => "file",
-        (None, None) => "unmarked-file",
+        (None, _) => "file",
     }
 }

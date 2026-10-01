@@ -1,9 +1,9 @@
-//! The repo side: marked code, found by scanning the files of every code
-//! source (this repo, and each `[[code]]`) for markers.
+//! The repo side: marked code, found in the files of every code source (this
+//! repo, and each `[[code]]`) that contain markers.
 
 use crate::config::{AsadocConfig, CodeSource};
 use crate::markers::{self, MarkedSection, MarkerHeader, MarkerOption, Markers, OptionSide};
-use crate::matching::Matcher;
+use crate::matching::{Matcher, SpacedPlaceholders};
 use anyhow::{Context, Result};
 use serde::Serialize;
 use std::sync::Arc;
@@ -12,8 +12,6 @@ use std::sync::Arc;
 const HASH_COMMENT_EXTENSIONS: &[&str] = &[
     "", "yaml", "yml", "sh", "bash", "conf", "cfg", "env", "py", "ini", "toml",
 ];
-const OTHER_TEXT_EXTENSIONS: &[&str] = &["txt", "j2", "tpl", "template"];
-const MAX_SCANNED_FILE_SIZE: u64 = 256 * 1024;
 
 fn extension(file: &str) -> &str {
     let file_name = file.rsplit('/').next().unwrap_or(file);
@@ -31,24 +29,15 @@ pub(crate) fn can_hold_markers(file: &str) -> bool {
     HASH_COMMENT_EXTENSIONS.contains(&extension(file)) || is_makefile(file)
 }
 
-/// The files of a code source that could hold marked code: text, small,
-/// and not excluded
-fn scanned_files(code_source: &CodeSource) -> Result<Vec<String>> {
-    Ok(code_source
-        .tree
-        .list_files()?
-        .into_iter()
-        .filter(|(file, size)| {
-            *size < MAX_SCANNED_FILE_SIZE
-                && !file.split('/').any(|path_component| path_component == "node_modules")
-                && !code_source
-                    .exclude
-                    .iter()
-                    .any(|excluded| file.starts_with(excluded.as_str()))
-                && (can_hold_markers(file) || OTHER_TEXT_EXTENSIONS.contains(&extension(file)))
-        })
-        .map(|(file, _)| file)
-        .collect())
+/// The files of a code source with markers in them, with their text
+fn files_with_markers(code_source: &CodeSource) -> Result<Vec<(String, String)>> {
+    code_source.tree.files_containing(markers::MARKER_PREFIX, |file| {
+        can_hold_markers(file)
+            && !code_source
+                .ignore_dir_prefix
+                .as_ref()
+                .is_some_and(|ignore_dir_prefix| file.starts_with(ignore_dir_prefix.as_str()))
+    })
 }
 
 /// A marked file, or a marked section of a file
@@ -66,6 +55,8 @@ pub(crate) struct MarkedCode {
     pub options: Vec<MarkerOption>,
     pub doc_options: Vec<MarkerOption>,
     pub placeholders: Vec<String>,
+    /// The regex each placeholder's value must match, where its `param` gives one
+    pub spaced_placeholders: SpacedPlaceholders,
     /// 1-based range of the marked lines (sections only)
     pub line_range: Option<(usize, usize)>,
     /// 1-based marker line numbers
@@ -74,7 +65,7 @@ pub(crate) struct MarkedCode {
     pub matcher: Arc<Matcher>,
 }
 
-/// A repo file, for finding code to mark
+/// A repo file with markers, for finding more code to mark in it
 pub(crate) struct RepoFile {
     /// Its name among all the code sources (see `CodeSource::qualify`)
     pub path: String,
@@ -90,11 +81,25 @@ pub(crate) struct MarkerProblem {
     pub message: String,
 }
 
+/// A `TODO` on a marker in this repo
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct Todo {
+    pub file: String,
+    /// The id of the marked code it's on (see `code_id`)
+    pub code_id: String,
+    /// 1-based line number of the marker line it's on
+    pub line: usize,
+    pub text: String,
+}
+
 pub(crate) struct RepoScan {
     pub marked: Vec<MarkedCode>,
     pub files: Vec<RepoFile>,
     /// This repo's (the other code sources' are theirs to report)
     pub problems: Vec<MarkerProblem>,
+    /// This repo's, like `problems`
+    pub todos: Vec<Todo>,
 }
 
 fn code_id(file: &str, section: Option<&str>) -> String {
@@ -118,14 +123,12 @@ pub(crate) fn scan(config: &AsadocConfig) -> Result<RepoScan> {
         marked: vec![],
         files: vec![],
         problems: vec![],
+        todos: vec![],
     };
     for (source_index, code_source) in config.code.iter().enumerate() {
-        let files = scanned_files(code_source).context("listing the files")?;
-        let texts = code_source.tree.read_all(&files).context("reading the files")?;
-        for (file, text) in files.iter().zip(texts) {
-            // Gone, or not text
-            let Some(text) = text else { continue };
-            scan_file(&mut scan, source_index, code_source.qualify(file), text)
+        let files = files_with_markers(code_source).context("finding the files with markers")?;
+        for (file, text) in files {
+            scan_file(&mut scan, source_index, code_source.qualify(&file), text)
                 .with_context(|| format!("scanning {}", code_source.describe()))?;
         }
     }
@@ -165,6 +168,12 @@ fn scan_file(scan: &mut RepoScan, source_index: usize, file: String, text: Strin
     }
     if source_index == 0 {
         scan.problems.extend(marker_problems);
+        scan.todos.extend(parsed_markers.todos.iter().map(|todo| Todo {
+            file: file.clone(),
+            code_id: code_id(&file, todo.section.as_deref()),
+            line: todo.line,
+            text: todo.text.clone(),
+        }));
     }
     scan.files.push(RepoFile {
         path: file,
@@ -227,13 +236,17 @@ fn add_marked(
     let (repo_side_options, doc_side_options): (Vec<_>, Vec<_>) = marked
         .options
         .iter()
+        .filter(|option| !option.is_note())
         .cloned()
         .partition(|option| option.side == OptionSide::Repo);
     match markers::apply_options(&marked.unapplied_content, &repo_side_options) {
         Ok(content) => {
             let placeholders =
                 markers::placeholders(&repo_side_options, &content).context("finding the placeholders")?;
-            let matcher = Matcher::new(&content, &placeholders).context("compiling the code for matching")?;
+            let spaced_placeholders = markers::spaced_placeholders(&repo_side_options, &content)
+                .context("finding the placeholders whose values may have spaces")?;
+            let matcher = Matcher::new(&content, &placeholders, &spaced_placeholders)
+                .context("compiling the code for matching")?;
             scan.marked.push(MarkedCode {
                 matcher: Arc::new(matcher),
                 id: code_id(file, marked.section),
@@ -242,6 +255,7 @@ fn add_marked(
                 section: marked.section.map(str::to_owned),
                 content,
                 placeholders,
+                spaced_placeholders,
                 options: repo_side_options,
                 doc_options: doc_side_options,
                 line_range: marked.line_range,

@@ -10,6 +10,7 @@ mod lightbulb;
 mod links;
 mod markers;
 mod matching;
+mod progress;
 mod repo;
 mod report;
 mod server;
@@ -27,9 +28,9 @@ struct AsadocCli {
     /// The config file (default: the nearest .asadoc/config.toml from here up)
     #[arg(long, global = true)]
     config: Option<PathBuf>,
-    /// A local docs checkout to read instead of the configured docs: `<dir>`,
-    /// or `<name>=<dir>` for one of several docs sources (repeatable)
-    #[arg(long, global = true, value_name = "[NAME=]DIR")]
+    /// A local docs checkout to read instead of a configured docs source:
+    /// `<name>=<dir>` (repeatable)
+    #[arg(long, global = true, value_name = "NAME=DIR")]
     docs: Vec<String>,
     /// A local checkout to read instead of the `[[code]]` named NAME (repeatable)
     #[arg(long, global = true, value_name = "NAME=DIR")]
@@ -50,9 +51,11 @@ enum AsadocCommand {
         #[arg(long, value_name = "CODE")]
         against: Option<String>,
     },
-    /// Make the change `asadoc check` lists under a doc block (marking a file
-    /// or lines of one, and similar simple changes)
+    /// Make the change `asadoc check` lists under a doc block (marking lines
+    /// of a file that has markers, and similar simple changes)
     Fix { block: String },
+    /// List the `TODO`s on this repo's markers, as `file:line: text`
+    Todo,
     /// Serve the review UI
     Serve {
         #[arg(long, default_value_t = 3000)]
@@ -91,9 +94,13 @@ fn run() -> Result<bool> {
                 check::check_refs(&evaluation, refs, against.as_deref()).context("checking what was given")
             }
         }
+        AsadocCommand::Todo => check::list_todos(&load_config()?).context("listing the TODOs"),
         AsadocCommand::Fix { block } => check::fix(&load_config()?, block).with_context(|| format!("fixing {block}")),
         AsadocCommand::Serve { port } => {
-            server::serve(load_config()?, *port).context("serving the review UI")?;
+            let (config_path, docs, code) = (cli.config.clone(), cli.docs.clone(), cli.code.clone());
+            let load_config =
+                move || config::AsadocConfig::load(config_path.as_deref(), &docs, &code).context("loading the config");
+            server::serve(load_config, *port).context("serving the review UI")?;
             Ok(true)
         }
     }

@@ -11,7 +11,13 @@ const asciidoctor = Asciidoctor();
 
 let data = null;
 let selectedKey = null;   // `${asm}:${ref}`
-let tab = 'todo';         // 'todo' | 'resolved' | 'ignored' | 'code'
+let tab = 'todo';         // 'todo' | 'resolved' | 'ignored' | 'code' | 'todos'
+// The tabs, under their category's title
+const CATEGORIES = [
+  { label: 'Doc code blocks', tabs: ['todo', 'resolved', 'ignored'] },
+  { label: 'Code', tabs: ['code'] },
+  { label: 'Comments', tabs: ['todos'] },
+];
 let query = '';
 let selectedCandidate = -1;   // index of the open recommendation, -1 when all are collapsed
 let ignoreChoice = null;  // the reason picked to ignore the block as (NEW_REASON for a new one), and the new one's fields
@@ -23,12 +29,7 @@ root.innerHTML = `
   <aside id="queue">
     <div class="queue-head"></div>
     <div class="queue-controls">
-      <div class="tabs">
-        <button data-tab="todo"></button>
-        <button data-tab="resolved"></button>
-        <button data-tab="ignored"></button>
-        <button data-tab="code"></button>
-      </div>
+      <div class="tabs"></div>
       <input type="search" placeholder="Search refs, files, sections, code…">
     </div>
     <div class="queue-list"></div>
@@ -77,7 +78,13 @@ function ignoredBlocks() {
 }
 
 function tabBlocks() {
-  return { todo: allBlocks, resolved: resolvedBlocks, ignored: ignoredBlocks, code: () => data.code }[tab]();
+  return { todo: allBlocks, resolved: resolvedBlocks, ignored: ignoredBlocks, code: () => data.code, todos: todoCode }[tab]();
+}
+
+// The marked code with TODOs, in the order of their first TODO
+function todoCode() {
+  const ids = [...new Set(data.todos.map(t => t.codeId))];
+  return ids.map(id => data.code.find(c => c.id === id)).filter(Boolean);
 }
 
 // Doc blocks are keyed by guide and ref, marked code by its id
@@ -131,6 +138,12 @@ function goToBlock(asm, ref) {
   select(key);
 }
 
+// Opens a piece of marked code in the marked code tab
+function goToCode(id) {
+  tab = 'code';
+  select(`code:${id}`);
+}
+
 function isResolved(b) {
   return !isMarkedCode(b) && 'code' in b;
 }
@@ -150,6 +163,7 @@ function toast(message, kind) {
 function cleanup() {
   for (const c of rendered) c.cleanUp();
   rendered = [];
+  hideTip();
 }
 
 const THEME = { dark: 'github-dark', light: 'github-light' };
@@ -164,57 +178,190 @@ function renderCode(mount, name, contents) {
   }
 }
 
-// Marker lines stand out in the file view, with the section name emphasized
+// Marker lines stand out in the file view, their parts colored by what they are
 const MARKER_CSS = `
   [data-line].dac-marker, [data-line].dac-marker [data-column-content], [data-line].dac-marker * {
     color: var(--dac-marker-fg) !important;
   }
   [data-line].dac-marker { background: var(--dac-marker-bg) !important; font-weight: 600; }
-  [data-line].dac-marker mark.dac-name, [data-line].dac-marker mark.dac-name * {
+  [data-line].dac-marker .dac-comment { opacity: 0.55; font-weight: 400; }
+  [data-line].dac-marker .dac-at { color: var(--dac-at-fg) !important; }
+  [data-line].dac-marker .dac-kind { color: var(--dac-kind-fg) !important; }
+  [data-line].dac-marker mark.dac-name {
     background: var(--dac-name-bg); color: var(--dac-name-fg) !important;
     border-radius: 3px; padding: 0 3px;
   }
+  [data-line].dac-marker .dac-pipe { color: var(--dac-pipe-fg) !important; font-weight: 400; }
+  [data-line].dac-marker .dac-side {
+    background: var(--dac-side-bg); color: var(--dac-side-fg) !important;
+    border-radius: 3px; padding: 0 3px; font-size: 0.92em;
+  }
+  [data-line].dac-marker .dac-key { color: var(--dac-key-fg) !important; }
+  [data-line].dac-marker .dac-value { color: var(--dac-value-fg) !important; font-weight: 500; }
+  [data-line].dac-marker .dac-wild { color: var(--dac-wild-fg) !important; font-weight: 700; }
+  [data-line].dac-marker .dac-punct { color: var(--dac-pipe-fg) !important; font-weight: 400; }
+  [data-line].dac-marker .dac-note .dac-key { font-style: italic; }
+  [data-line].dac-marker .dac-note .dac-value { font-style: italic; font-weight: 400; color: var(--dac-note-fg) !important; }
+  [data-line].dac-marker .dac-todo .dac-key { color: var(--dac-todo-fg) !important; font-style: normal; }
+  [data-line].dac-marker .dac-unknown .dac-key { text-decoration: wavy underline var(--dac-todo-fg); }
+  [data-line].dac-marker [data-tip] { cursor: help; border-radius: 3px; transition: background 0.1s; }
+  [data-line].dac-marker [data-tip]:hover { background: var(--dac-hover-bg); }
 `;
 
-// A whole file, with a range of lines highlighted and scrolled into view, and
-// the marker lines around it (and the section name in them) emphasized
-function renderFile(mount, name, contents, lines, markerLines = [], sectionName = null) {
-  try {
-    const f = new File({ theme: THEME, themeType: 'system', overflow: 'wrap', disableFileHeader: true, unsafeCSS: MARKER_CSS });
-    f.render({ file: { name, contents }, containerWrapper: mount });
-    rendered.push(f);
-    if (lines) f.setSelectedLines({ start: lines[0], end: lines[1] });
-    let tries = 0;
-    const decorate = () => {
-      const root = mount.querySelector('*')?.shadowRoot;
-      const rows = root ? markerLines.flatMap(n => [...root.querySelectorAll(`[data-line="${n}"]`)]) : [];
-      if (!rows.length && markerLines.length && tries++ < 20) { setTimeout(decorate, 100); return; }
-      for (const row of rows) {
-        row.classList.add('dac-marker');
-        if (sectionName) markText(row, `"${sectionName}"`);
-      }
-      const target = root?.querySelector(`[data-line="${markerLines[0] ?? lines?.[0]}"]`);
-      if (target) mount.scrollTop += target.getBoundingClientRect().top - mount.getBoundingClientRect().top - 40;
-    };
-    requestAnimationFrame(decorate);
-  } catch {
-    mount.appendChild(el('pre', 'fallback', esc(contents)));
+// What each marker option does to `target` (the code, or the doc blocks it's
+// compared with), in words. `v` is its value as written, unquoted.
+const OPTION_HELP = {
+  'remove-prefix': (v, target) => `Strips ${tipCode(v)} from the start of the first line of ${target}, after its indentation.`,
+  'remove-suffix': (v, target) => `Strips ${tipCode(v)} from the end of the last line of ${target}.`,
+  'strip-line-prefix': (v, target) => `Strips ${tipCode(v)} from the start of every line of ${target} that has it.`,
+  'remove-lines-starting-with': (v, target) => `Drops the lines of ${target} whose text, after indentation, starts with ${tipCode(v)}.${wildcardHelp(v)}`,
+  'remove-text': (v, target, side) => `Removes every match of the regex ${tipCode(v)} from ${target}, across lines too. When it matches nothing, ${side === 'doc' ? "the doc block doesn't match" : "it's a marker problem"}, so a changed text shows up.`,
+  'remove-blank-lines': (_, target) => `Drops the lines of ${target} that are empty or only whitespace.`,
+  'unindent-common': (_, target) => `Removes the indentation all non-blank lines of ${target} share.`,
+  reindent: (v, target) => {
+    const [from, to] = v.split(/\s*->\s*/);
+    return `Turns each ${from} spaces of leading indentation in ${target} into ${to} spaces.`;
+  },
+  param: (v, target) => /\*/.test(v)
+    ? `Makes every ${tipCode(v)} in ${target} a placeholder: the other side can have any value there.${wildcardHelp(v)}`
+    : `Makes ${tipCode(v)} in ${target} a placeholder: the other side can have any value in its place.`,
+  comment: () => 'A note for people reading the marker. It changes nothing.',
+  TODO: () => 'Work left on this marked code. It changes nothing, but <code>asadoc check</code> and the review UI list it.',
+};
+
+function tipCode(v) {
+  return `<code>${esc(v)}</code>`;
+}
+
+function wildcardHelp(v) {
+  const parts = [];
+  if (v.includes('**')) parts.push('<code>**</code> stands for anything up to the next text on the line');
+  if (/(^|[^*])\*([^*]|$)/.test(v)) parts.push('<code>*</code> for any text without whitespace');
+  return parts.length ? ` Here ${parts.join(', and ')}.` : '';
+}
+
+// The parts of a marker line, as HTML: each part that means something gets a
+// `data-tip`, an index into `tips`, whose entry says what it means
+function markerLineHtml(text, tips) {
+  const tip = (title, side, body) => tips.push({ title, side, body }) - 1;
+  const out = [];
+  let rest;
+  const head = text.match(/^(.*?)(@docs-as-code:)(\s*)(.*)$/);
+  if (head) {
+    out.push(`<span class="dac-comment">${esc(head[1])}</span>`);
+    out.push(`<span class="dac-at" data-tip="${tip('@docs-as-code:', null, 'Marks repo code that appears in the docs. Every doc code block is compared with what it marks, after its options are applied.')}">${esc(head[2])}</span>`, esc(head[3]));
+    rest = head[4];
+    const kind = rest.match(/^(file|start section|end section)(\s*)("(?:[^"\\]|\\.)*")?/);
+    if (kind) {
+      const what = {
+        file: ['Whole file', 'Marks the whole file, apart from this marker and its option lines. A file marked whole can\'t also have sections.'],
+        'start section': ['Section start', 'Marks the lines from here to the end marker with the same name, markers excluded.'],
+        'end section': ['Section end', 'Ends the section started with the same name.'],
+      }[kind[1]];
+      out.push(`<span class="dac-kind" data-tip="${tip(what[0], null, what[1])}">${esc(kind[1])}</span>`, esc(kind[2]));
+      if (kind[3]) out.push(`<mark class="dac-name" data-tip="${tip('Section name', null, 'Pairs the start marker with its end marker, and names this code in the review UI and on the command line (<code>file#name</code>).')}">${esc(kind[3])}</mark>`);
+      rest = rest.slice(kind[0].length);
+    }
+  } else {
+    const i = text.indexOf('|');
+    if (i === -1) return null;
+    out.push(`<span class="dac-comment">${esc(text.slice(0, i))}</span>`);
+    rest = text.slice(i);
+  }
+  // Options: `| [doc ]key[: value]`, value quoted or `<from> -> <to>`
+  const option = /(\s*)\|(\s*)(?:(doc)(\s+))?([A-Za-z][\w-]*)(?:(\s*:\s*)("(?:[^"\\]|\\.)*"|\d+\s*->\s*\d+))?/y;
+  let m;
+  while (rest && (m = option.exec(rest))) {
+    const [, before, after, side, sideSpace, key, colon, raw] = m;
+    const value = raw?.startsWith('"') ? (key === 'remove-text' ? raw.slice(1, -1).replace(/\\"/g, '"') : raw.slice(1, -1).replace(/\\(.)/g, '$1')) : raw ?? '';
+    const help = OPTION_HELP[key];
+    const target = side ? 'each doc block it\'s compared with' : 'the marked code';
+    const body = help ? help(value, target, side ? 'doc' : 'code') : 'Not an option asadoc knows: it\'s reported as a marker problem.';
+    const cls = !help ? 'dac-unknown' : key === 'TODO' ? 'dac-note dac-todo' : key === 'comment' ? 'dac-note' : '';
+    let valueHtml = '';
+    if (raw) {
+      const shown = (key === 'param' || key === 'remove-lines-starting-with')
+        ? esc(raw).replace(/\*\*|\*/g, w => `<span class="dac-wild">${w}</span>`)
+        : esc(raw);
+      valueHtml = `<span class="dac-punct">${esc(colon)}</span><span class="dac-value">${shown}</span>`;
+    }
+    out.push(esc(before), `<span class="dac-opt ${cls}" data-tip="${tip(key, help && !(key === 'comment' || key === 'TODO') ? (side ? 'doc' : 'code') : null, body)}">`
+      + `<span class="dac-pipe">|</span>${esc(after)}`
+      + (side ? `<span class="dac-side">${side}</span>${esc(sideSpace)}` : '')
+      + `<span class="dac-key">${esc(key)}</span>${valueHtml}</span>`);
+    rest = rest.slice(option.lastIndex);
+    option.lastIndex = 0;
+  }
+  out.push(esc(rest));
+  return out.join('');
+}
+
+// The card that says what the part of a marker under the mouse means
+const tipEl = document.body.appendChild(el('div', 'marker-tip'));
+
+function showTip(target, { title, side, body }) {
+  const sideLabel = side === 'doc' ? '<span class="tip-side doc">doc side</span>' : side === 'code' ? '<span class="tip-side">code side</span>' : '';
+  tipEl.innerHTML = `<div class="tip-head"><code>${esc(title)}</code>${sideLabel}</div><p>${body}</p>`;
+  tipEl.classList.add('shown');
+  const r = target.getBoundingClientRect();
+  const w = tipEl.offsetWidth, h = tipEl.offsetHeight;
+  const left = Math.min(Math.max(8, r.left), window.innerWidth - w - 8);
+  const top = r.bottom + 6 + h > window.innerHeight ? r.top - h - 6 : r.bottom + 6;
+  tipEl.style.left = `${left}px`;
+  tipEl.style.top = `${top}px`;
+}
+
+function hideTip() {
+  tipEl.classList.remove('shown');
+}
+
+// Colors a marker line's parts, and explains each when hovered
+function decorateMarkerLine(row) {
+  const tips = [];
+  const html = markerLineHtml(row.textContent, tips);
+  if (html == null) return;
+  row.innerHTML = html;
+  for (const part of row.querySelectorAll('[data-tip]')) {
+    part.addEventListener('mouseenter', () => showTip(part, tips[part.dataset.tip]));
+    part.addEventListener('mouseleave', hideTip);
   }
 }
 
-// Wraps the first occurrence of `needle` within an element's text in <mark>
-function markText(root, needle) {
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT);
-  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-    const i = node.data.indexOf(needle);
-    if (i === -1) continue;
-    const mark = document.createElement('mark');
-    mark.className = 'dac-name';
-    const rest = node.splitText(i);
-    rest.splitText(needle.length);
-    rest.parentNode.replaceChild(mark, rest);
-    mark.appendChild(rest);
-    return;
+// A whole file, with a range of lines highlighted and scrolled into view, and
+// the marker lines around it emphasized. The file renders more than once
+// (plain, then highlighted when its language loads), so each render's marker
+// lines get decorated, and it's scrolled to them again as its layout settles,
+// until the user scrolls it.
+function renderFile(mount, name, contents, lines, markerLines = []) {
+  let userScrolled = false;
+  const scrollToMarkers = () => {
+    const root = mount.querySelector('*')?.shadowRoot;
+    const target = root?.querySelector(`[data-line="${markerLines[0] ?? lines?.[0]}"]`);
+    if (userScrolled || !target) return;
+    mount.scrollTop += target.getBoundingClientRect().top - mount.getBoundingClientRect().top - 40;
+  };
+  const decorate = (node, _file, phase) => {
+    if (phase === 'unmount') return;
+    const root = node.shadowRoot ?? node;
+    for (const row of markerLines.flatMap(n => [...root.querySelectorAll(`[data-line="${n}"]`)])) {
+      if (row.classList.contains('dac-marker')) continue;
+      row.classList.add('dac-marker');
+      decorateMarkerLine(row);
+    }
+    scrollToMarkers();
+  };
+  try {
+    const f = new File({ theme: THEME, themeType: 'system', overflow: 'wrap', disableFileHeader: true, unsafeCSS: MARKER_CSS, onPostRender: decorate });
+    f.render({ file: { name, contents }, containerWrapper: mount });
+    rendered.push(f);
+    if (lines) f.setSelectedLines({ start: lines[0], end: lines[1] });
+    for (const event of ['wheel', 'pointerdown', 'keydown', 'touchstart']) mount.addEventListener(event, () => { userScrolled = true; }, { once: true });
+    mount.addEventListener('scroll', hideTip);
+    const resizes = new ResizeObserver(scrollToMarkers);
+    resizes.observe(mount.firstElementChild);
+    rendered.push({ cleanUp: () => resizes.disconnect() });
+  } catch {
+    mount.appendChild(el('pre', 'fallback', esc(contents)));
   }
 }
 
@@ -261,7 +408,7 @@ async function act(path, body, button) {
 // Re-reads both repos. When the block on screen got resolved meanwhile (by an
 // edit elsewhere), says so and moves on to the one that took its place.
 async function rescan() {
-  const listState = () => JSON.stringify([allBlocks().map(keyOf), resolvedBlocks().map(b => [keyOf(b), howResolved(b)]), ignoredBlocks().map(b => [keyOf(b), b.ignoredAs]), data.staleIgnored, data.code.map(c => [c.id, c.matchedBy.length]), data.problems]);
+  const listState = () => JSON.stringify([allBlocks().map(keyOf), resolvedBlocks().map(b => [keyOf(b), howResolved(b)]), ignoredBlocks().map(b => [keyOf(b), b.ignoredAs]), data.staleIgnored, data.code.map(c => [c.id, c.matchedBy.length]), data.problems, data.todos]);
   const before = visibleBlocks();
   const idx = before.findIndex(b => keyOf(b) === selectedKey);
   const shown = () => JSON.stringify([selectedBlock(), data.ignoreReasons]);
@@ -270,8 +417,14 @@ async function rescan() {
   await load();
   const blocks = visibleBlocks();
   if (selectedKey && idx !== -1 && !blocks.some(b => keyOf(b) === selectedKey)) {
+    // A resolved or ignored block that moved to another tab: follow it there
+    if (tab === 'resolved' || tab === 'ignored') {
+      const has = list => list.some(b => keyOf(b) === selectedKey);
+      const now = has(allBlocks()) ? 'todo' : has(resolvedBlocks()) ? 'resolved' : has(ignoredBlocks()) ? 'ignored' : null;
+      if (now) { tab = now; select(selectedKey); return; }
+    }
     toast(tab === 'todo' ? `✓ ${selectedKey.split(':')[1]} is resolved`
-      : tab === 'code' ? `${selectedKey.slice(5)} is no longer marked` : `${selectedKey.split(':')[1]} is back in the queue`, 'ok');
+      : tab === 'code' || tab === 'todos' ? `${selectedKey.slice(5)} is no longer marked` : `${selectedKey.split(':')[1]} is gone`, 'ok');
     const next = blocks[Math.min(Math.max(idx, 0), blocks.length - 1)];
     select(next ? keyOf(next) : null);
     return;
@@ -298,19 +451,19 @@ function renderQueue() {
     </div>
     <div class="bar"><div style="width:${data.total ? (100 * (data.total - remaining)) / data.total : 100}%"></div></div>`;
   headEl.querySelector('button').addEventListener('click', rescan);
-  for (const btn of queueEl.querySelectorAll('.tabs button')) {
-    const t = btn.dataset.tab;
-    btn.className = t === tab ? 'active' : '';
-    const [label, count] = {
-      todo: ['To resolve', remaining], resolved: ['Resolved', resolvedBlocks().length],
-      ignored: ['Ignored', ignoredBlocks().length], code: ['Marked code', data.code.length],
-    }[t];
-    btn.innerHTML = `${label} <span class="count">${count}</span>`;
-  }
+  const tabLabels = {
+    todo: ['To resolve', remaining], resolved: ['Resolved', resolvedBlocks().length],
+    ignored: ['Ignored', ignoredBlocks().length], code: ['Marked code', data.code.length],
+    todos: ['TODOs', data.todos.length],
+  };
+  queueEl.querySelector('.tabs').innerHTML = CATEGORIES.map(c => `
+    <div class="tab-category">${c.label}</div>
+    <div class="tab-row">${c.tabs.map(t => `<button data-tab="${t}" class="${t === tab ? 'active' : ''}">${tabLabels[t][0]} <span class="count">${tabLabels[t][1]}</span></button>`).join('')}</div>`).join('');
 
   listEl.innerHTML = '';
   const list = listEl;
   if (tab === 'code') { renderCodeList(list); return; }
+  if (tab === 'todos') { renderTodoList(list); return; }
   let shown = 0;
   for (const g of data.guides) {
     const blocks = { todo: g.blocks, resolved: g.resolved, ignored: g.ignored }[tab].filter(matchesQuery);
@@ -358,6 +511,29 @@ function renderQueue() {
   }
 }
 
+// The TODOs tab: every `| TODO` on this repo's markers, by file; each opens
+// the marked code it's on
+function renderTodoList(list) {
+  const todos = data.todos.filter(t => !query || `${t.file} ${t.text}`.toLowerCase().includes(query));
+  let file = null;
+  for (const t of todos) {
+    if (t.file !== file) {
+      file = t.file;
+      list.appendChild(el('div', 'guide', `<span>${esc(file)}</span><span class="count">${todos.filter(o => o.file === file).length}</span>`));
+    }
+    const key = `code:${t.codeId}`;
+    const code = data.code.find(c => c.id === t.codeId);
+    const item = el('button', 'item' + (key === selectedKey ? ' selected' : ''));
+    item.innerHTML = `
+      <span class="item-main">${esc(t.text)}</span>
+      <span class="item-sub">line ${t.line}${code?.snippet ? ` · § ${esc(code.snippet)}` : ''}</span>`;
+    if (code) item.addEventListener('click', () => select(key));
+    else item.disabled = true;
+    list.appendChild(item);
+  }
+  if (!todos.length) list.appendChild(el('div', 'note', query ? 'Nothing matches the search.' : 'No marker has a <code>| TODO</code>.'));
+}
+
 // The marked code tab: unmatched first, then matched
 function renderCodeList(list) {
   const code = data.code.filter(matchesQuery);
@@ -395,17 +571,11 @@ function select(key) {
 
 // An assembly's title, after its docs source's name when there are several
 function guideLabel(g) {
-  return g.docsName ? `${g.docsName} › ${g.title}` : g.title;
+  return `${g.docsName} › ${g.title}`;
 }
 
 function aiPrompt(b) {
-  const guide = data.guides.find(g => g.id === b.asm);
-  return `In this repo, make marked code match this docs code block. Run \`asadoc guide\` first to learn how markers work.
-
-  ${b.ref}: modules/${b.module}.adoc, line ${b.line}, in the docs at ${guide.docsLocation}
-
-Don't edit the docs.
-Check with \`asadoc check ${b.ref}\`: it says why the block isn't resolved, with a diff. You're done when it reports ✓ resolved; show that output.
+  return `\`asadoc check ${b.ref} || asadoc guide\`.
 `;
 }
 
@@ -474,7 +644,6 @@ function describePlan(o) {
   const steps = [];
   for (const f of plan.fixes) {
     switch (f.type) {
-      case 'mark-file': steps.push('Add a <code># @docs-as-code: file</code> line at the top, marking the whole file'); break;
       case 'mark-section':
         steps.push(`Add start and end markers around lines ${region[0]}–${region[1]}, making them section <code>${esc(f.name)}</code>`);
         for (const opt of f.options || []) steps.push(describeOption(opt, o, region));
@@ -505,8 +674,7 @@ function partLabel(o) {
   switch (o.kind) {
     case 'section': return `<span class="part-icon">§</span><code>${esc(o.name)}</code>${lines}`;
     case 'file': return '<span class="part-icon">§</span>Whole file';
-    case 'lines': return `<span class="part-icon unmarked">§</span><span class="unmarked">Would become a section</span>${lines}`;
-    default: return '<span class="part-icon unmarked">§</span><span class="unmarked">Whole file, not marked</span>';
+    default: return `<span class="part-icon unmarked">§</span><span class="unmarked">Would become a section</span>${lines}`;
   }
 }
 
@@ -534,7 +702,7 @@ function candidateBody(b, o) {
     o.kind === 'lines' ? `${o.file}, lines ${o.lines[0]}-${o.lines[1]}` : (o.name ? `${o.file}, section ${o.name}` : o.file) + (o.options.length ? ' (marker options applied)' : ''), o.content);
   const view = el('div', 'file-view');
   body.appendChild(view);
-  renderFile(view, o.file, o.fileText, o.kind === 'section' || o.kind === 'lines' ? o.lines : null, o.markerLines, o.name);
+  renderFile(view, o.file, o.fileText, o.kind === 'section' || o.kind === 'lines' ? o.lines : null, o.markerLines);
   return body;
 }
 
@@ -614,7 +782,12 @@ function renderResolved(b, guide) {
     const where = c.snippet
       ? `<code>${esc(c.file)}</code><span class="sep">›</span><span class="part-icon">§</span><code>${esc(c.snippet)}</code><span class="lines">lines ${c.lines[0]}–${c.lines[1]}</span>`
       : `<code>${esc(c.file)}</code><span class="lines">whole file</span>`;
-    sec.appendChild(el('div', 'resolved-head', `<span class="st exact">✓ Resolved</span> Matches ${where}`));
+    const head = el('div', 'resolved-head', '<span class="st exact">✓ Resolved</span> Matches ');
+    const link = el('button', 'link code-link', where);
+    link.title = 'Open this marked code';
+    link.addEventListener('click', () => goToCode(c.id));
+    head.appendChild(link);
+    sec.appendChild(head);
     // What the doc put where the code has placeholders
     const values = Object.entries(c.values || {});
     if (values.length) {
@@ -626,7 +799,7 @@ function renderResolved(b, guide) {
     sec.appendChild(view);
     fetchText(fileCache, `/api/file?path=${encodeURIComponent(c.file)}`).then(text => {
       if (text == null || selectedBlock() !== b) return;
-      renderFile(view, c.file, text, c.snippet ? c.lines : null, c.markerLines, c.snippet);
+      renderFile(view, c.file, text, c.snippet ? c.lines : null, c.markerLines);
     });
   }
   blockEl.appendChild(sec);
@@ -642,7 +815,14 @@ function renderMarkedCode(c) {
     <div class="head-row">
       <span class="ref">${esc(c.file)}</span>${where}
       ${c.link ? `<a href="${c.link}" target="_blank">Source ↗</a>` : ''}
+      <button class="secondary remove-markers" title="Delete this code's markers, leaving the code itself">Remove markers</button>
     </div>`));
+  blockEl.querySelector('.remove-markers').addEventListener('click', (e) => {
+    const n = c.matchedBy.length;
+    if (n && !confirm(`${codeName(c)} matches ${n} doc block${n > 1 ? 's' : ''} (${c.matchedBy.map(m => m.ref).join(', ')}). `
+      + `Without its markers, ${n > 1 ? 'they go' : 'it goes'} back to the blocks to resolve. Remove the markers anyway?`)) return;
+    act('/api/remove-markers', { id: c.id }, e.currentTarget);
+  });
 
   const sec = el('section', 'resolved');
   const blockLink = (asm, ref, extra = '') => {
@@ -655,12 +835,6 @@ function renderMarkedCode(c) {
     sec.appendChild(el('div', 'resolved-head', `<span class="st exact">✓ Matched</span> by ${c.matchedBy.length} doc block${c.matchedBy.length > 1 ? 's' : ''}`));
     for (const m of c.matchedBy) {
       sec.appendChild(blockLink(m.asm, m.ref));
-      const values = Object.entries(m.values || {});
-      if (values.length) {
-        sec.appendChild(el('table', 'param-values', `
-          <thead><tr><th>Param in the repo</th><th>Value in the doc</th></tr></thead>
-          <tbody>${values.map(([p, v]) => `<tr><td><code>${esc(p)}</code></td><td><code>${v ? esc(v) : '<span class="muted">(empty)</span>'}</code></td></tr>`).join('')}</tbody>`));
-      }
     }
   } else {
     sec.appendChild(el('div', 'resolved-head', '<span class="st">Unmatched</span> No doc block matches it.'));
@@ -675,7 +849,7 @@ function renderMarkedCode(c) {
   sec.appendChild(view);
   fetchText(fileCache, `/api/file?path=${encodeURIComponent(c.file)}`).then(text => {
     if (text == null || selectedBlock() !== c) return;
-    renderFile(view, c.file, text, c.snippet ? c.lines : null, c.markerLines, c.snippet);
+    renderFile(view, c.file, text, c.snippet ? c.lines : null, c.markerLines);
   });
   blockEl.appendChild(sec);
 }
@@ -838,7 +1012,40 @@ events.onmessage = () => rescan();
 events.onerror = () => { lostServer = true; };
 events.onopen = () => { if (lostServer) location.reload(); };
 
+// Until the server has the review UI ready (it serves right away, and loads
+// the config and evaluates in the background), says what it's busy with.
+// Returns the screen still up (or null), for taking down once the page shows.
+async function untilReady() {
+  let screen = null;
+  for (;;) {
+    let status;
+    try {
+      status = await (await fetch('/api/status')).json();
+    } catch {
+      status = { state: 'preparing', step: 'waiting for the asadoc server', seconds: null };
+    }
+    if (status.state === 'ready') return screen;
+    if (!screen) screen = document.body.appendChild(el('div', 'preparing'));
+    if (status.state === 'failed') {
+      screen.innerHTML = `<div class="preparing-box failed">
+        <div class="title">asadoc couldn't prepare the review UI</div>
+        <pre>${esc(status.error)}</pre>
+        <p class="muted">Fix this, then restart <code>asadoc serve</code>.</p></div>`;
+      return new Promise(() => {});
+    }
+    const elapsed = status.seconds == null ? '' : ` <span class="muted">· ${status.seconds}s</span>`;
+    screen.innerHTML = `<div class="preparing-box">
+      <div class="title"><span class="spinner"></span>Preparing the review UI…</div>
+      <p>${esc(status.step || 'starting')}${elapsed}</p>
+      <p class="muted">asadoc is reading the docs and the code. The first run fetches the docs, which
+        can take a while. This page opens by itself when it's ready.</p></div>`;
+    await new Promise(r => setTimeout(r, 500));
+  }
+}
+
 (async () => {
+  const screen = await untilReady();
+  screen?.querySelector('p')?.replaceChildren('loading the review');
   await load();
   const fromHash = decodeURIComponent(location.hash.slice(1));
   if (resolvedBlocks().some(b => keyOf(b) === fromHash)) tab = 'resolved';
@@ -847,4 +1054,5 @@ events.onopen = () => { if (lostServer) location.reload(); };
   selectedKey = tabBlocks().some(b => keyOf(b) === fromHash) ? fromHash : (tabBlocks()[0] ? keyOf(tabBlocks()[0]) : null);
   renderQueue();
   renderBlock();
+  screen?.remove();
 })();

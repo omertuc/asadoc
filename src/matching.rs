@@ -1,15 +1,19 @@
 //! Comparing marked code with doc blocks: exactly, except where the code has
-//! placeholders (declared with `param`), which match any value on their line,
-//! the same value wherever the same placeholder appears.
+//! placeholders (declared with `param`), which match a value without
+//! whitespace (any value on their line, for those from a `**` wildcard).
 
 use anyhow::{Context, Result};
 use fancy_regex::Regex;
 use std::cmp::Reverse;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write;
 
-/// The value each placeholder took
+/// The value each placeholder took (its distinct values, comma-separated, when
+/// it appears several times)
 pub(crate) type PlaceholderValues = BTreeMap<String, String>;
+
+/// The placeholders whose value may have whitespace
+pub(crate) type SpacedPlaceholders = BTreeSet<String>;
 
 struct PlaceholderPattern {
     regex: Regex,
@@ -30,7 +34,7 @@ fn placeholder_finder(placeholders: &[&String]) -> Result<Regex> {
 }
 
 impl PlaceholderPattern {
-    fn new(content: &str, placeholders: &[&String]) -> Result<Self> {
+    fn new(content: &str, placeholders: &[&String], spaced: &SpacedPlaceholders) -> Result<Self> {
         let finder = placeholder_finder(placeholders)?;
         let mut placeholder_groups: Vec<(String, String)> = Vec::new();
         let mut regex_source = String::from(r"\A");
@@ -42,16 +46,14 @@ impl PlaceholderPattern {
                 .context("placeholder match isn't on character boundaries")?;
             regex_source.push_str(&fancy_regex::escape(text_before_placeholder));
             let placeholder = placeholder_match.as_str();
-            if let Some((_, group_name)) = placeholder_groups
-                .iter()
-                .find(|(known_placeholder, _)| known_placeholder == placeholder)
-            {
-                write!(regex_source, r"\k<{group_name}>").context("writing a placeholder backreference")?;
+            let group_name = format!("p{}", placeholder_groups.len());
+            let value_pattern = if spaced.contains(placeholder) {
+                r"[^\n]*?"
             } else {
-                let group_name = format!("p{}", placeholder_groups.len());
-                write!(regex_source, r"(?<{group_name}>[^\n]*?)").context("writing a placeholder group")?;
-                placeholder_groups.push((placeholder.to_owned(), group_name));
-            }
+                r"\S*?"
+            };
+            write!(regex_source, r"(?<{group_name}>{value_pattern})").context("writing a placeholder group")?;
+            placeholder_groups.push((placeholder.to_owned(), group_name));
             consumed_until = placeholder_match.end();
         }
         let text_after_placeholders = content
@@ -69,18 +71,18 @@ impl PlaceholderPattern {
         let Some(captures) = self.regex.captures(doc).context("matching the code's pattern")? else {
             return Ok(None);
         };
+        let mut values_per_placeholder: BTreeMap<&str, Vec<&str>> = BTreeMap::new();
+        for (placeholder, group_name) in &self.placeholder_groups {
+            let value = captures.name(group_name).map_or("", |capture| capture.as_str());
+            let values = values_per_placeholder.entry(placeholder).or_default();
+            if !values.contains(&value) {
+                values.push(value);
+            }
+        }
         Ok(Some(
-            self.placeholder_groups
-                .iter()
-                .map(|(placeholder, group_name)| {
-                    (
-                        placeholder.clone(),
-                        captures
-                            .name(group_name)
-                            .map(|capture| capture.as_str().to_owned())
-                            .unwrap_or_default(),
-                    )
-                })
+            values_per_placeholder
+                .into_iter()
+                .map(|(placeholder, values)| (placeholder.to_owned(), values.join(", ")))
                 .collect(),
         ))
     }
@@ -112,7 +114,7 @@ pub(crate) struct Matcher {
 }
 
 impl Matcher {
-    pub(crate) fn new(content: &str, placeholders: &[String]) -> Result<Self> {
+    pub(crate) fn new(content: &str, placeholders: &[String], spaced: &SpacedPlaceholders) -> Result<Self> {
         let used_placeholders: Vec<&String> = placeholders
             .iter()
             .filter(|placeholder| content.contains(placeholder.as_str()))
@@ -128,7 +130,7 @@ impl Matcher {
                 if placeholders_on_line.is_empty() {
                     Ok(None)
                 } else {
-                    PlaceholderPattern::new(line, &placeholders_on_line)
+                    PlaceholderPattern::new(line, &placeholders_on_line, spaced)
                         .map(Some)
                         .with_context(|| format!("building the pattern for line {line:?}"))
                 }
@@ -140,7 +142,7 @@ impl Matcher {
                 None
             } else {
                 Some(
-                    PlaceholderPattern::new(content, &used_placeholders)
+                    PlaceholderPattern::new(content, &used_placeholders, spaced)
                         .context("building the pattern for the whole code")?,
                 )
             },
@@ -210,14 +212,19 @@ fn fill_line(
 }
 
 /// One-off matching (for content that isn't compiled ahead of time)
-pub(crate) fn match_content(content: &str, placeholders: &[String], doc: &str) -> Result<Option<PlaceholderValues>> {
+pub(crate) fn match_content(
+    content: &str,
+    placeholders: &[String],
+    spaced: &SpacedPlaceholders,
+    doc: &str,
+) -> Result<Option<PlaceholderValues>> {
     if !placeholders
         .iter()
         .any(|placeholder| content.contains(placeholder.as_str()))
     {
         return Ok((content == doc).then(PlaceholderValues::new));
     }
-    Matcher::new(content, placeholders)
+    Matcher::new(content, placeholders, spaced)
         .context("compiling the content for matching")?
         .matches(doc)
 }
@@ -228,13 +235,31 @@ mod tests {
     use super::*;
 
     #[test]
-    fn placeholders_match_consistently() -> Result<()> {
+    fn each_placeholder_occurrence_matches_on_its_own() -> Result<()> {
+        let none_spaced = SpacedPlaceholders::new();
         let placeholders = vec!["<A>".to_owned()];
-        let values = match_content("x: <A>\ny: <A>\n", &placeholders, "x: 1\ny: 1\n")?.context("no match")?;
+        let values =
+            match_content("x: <A>\ny: <A>\n", &placeholders, &none_spaced, "x: 1\ny: 1\n")?.context("no match")?;
         assert_eq!(values["<A>"], "1");
-        assert!(match_content("x: <A>\ny: <A>\n", &placeholders, "x: 1\ny: 2\n")?.is_none());
-        assert!(match_content("x: <A>\n", &placeholders, "x: 1\n2\n")?.is_none());
-        assert_eq!(match_content("same\n", &[], "same\n")?, Some(PlaceholderValues::new()));
+        let values =
+            match_content("x: <A>\ny: <A>\n", &placeholders, &none_spaced, "x: 1\ny: 2\n")?.context("no match")?;
+        assert_eq!(values["<A>"], "1, 2");
+        assert!(match_content("x: <A>\n", &placeholders, &none_spaced, "x: 1\n2\n")?.is_none());
+        assert_eq!(
+            match_content("same\n", &[], &none_spaced, "same\n")?,
+            Some(PlaceholderValues::new())
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn values_have_no_whitespace_unless_spaced() -> Result<()> {
+        let placeholders = vec!["${MTU}".to_owned()];
+        let spaced = SpacedPlaceholders::from(["${MTU}".to_owned()]);
+        let commented = "mtu: 1500 # standard\n";
+        assert!(match_content("mtu: ${MTU}\n", &placeholders, &SpacedPlaceholders::new(), commented)?.is_none());
+        let values = match_content("mtu: ${MTU}\n", &placeholders, &spaced, commented)?.context("no match")?;
+        assert_eq!(values["${MTU}"], "1500 # standard");
         Ok(())
     }
 
@@ -242,13 +267,14 @@ mod tests {
     fn fills_placeholders_for_display() -> Result<()> {
         let placeholders = vec!["${V}".to_owned()];
         assert_eq!(
-            Matcher::new("a ${V}\nb", &placeholders)?.fill("c\na 4.22\n")?,
+            Matcher::new("a ${V}\nb", &placeholders, &SpacedPlaceholders::new())?.fill("c\na 4.22\n")?,
             "a 4.22\nb"
         );
         // In order: the second `end:` takes the second value
         let placeholders = vec!["<A>".to_owned(), "<B>".to_owned()];
         assert_eq!(
-            Matcher::new("end: <A>\nx\nend: <B>\n", &placeholders)?.fill("end: 1\nx\nend: 45\n")?,
+            Matcher::new("end: <A>\nx\nend: <B>\n", &placeholders, &SpacedPlaceholders::new())?
+                .fill("end: 1\nx\nend: 45\n")?,
             "end: 1\nx\nend: 45\n"
         );
         Ok(())
