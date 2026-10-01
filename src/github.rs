@@ -1,6 +1,6 @@
 //! `asadoc check --format markdown` and `--format github`: the report as
 //! markdown (for a GitHub job summary or PR comment), and as GitHub workflow
-//! annotations on the code it's about.
+//! annotations on markers in this repo that can't be read.
 
 use std::env;
 use std::fmt::Write as _;
@@ -13,8 +13,9 @@ use crate::check;
 use crate::config::AsadocConfig;
 use crate::docs;
 use crate::eval::{AssemblyEval, BlockEval, CandidateInfo, Evaluation};
+use crate::markers::MARKER_PREFIX;
 use crate::repo::MarkedCode;
-use crate::report::{self, CheckOutcome, CheckSummary, Closest, LineDiff, Sides};
+use crate::report::{self, CheckOutcome, CheckSummary, Closest, Sides};
 use anyhow::{Context, Result};
 
 /// Diff lines shown per block; the rest are left to `asadoc check <block>`
@@ -32,7 +33,7 @@ pub(crate) fn print_markdown(config: &AsadocConfig, evaluation: &Evaluation) -> 
 pub(crate) fn report(config: &AsadocConfig, evaluation: &Evaluation) -> Result<bool> {
     let summary = CheckSummary::build(config, evaluation).context("summarizing the evaluation")?;
     check::print_summary(&summary);
-    print_annotations(config, evaluation, &summary);
+    print_annotations(config, &summary);
     let summary_path = env::var_os("GITHUB_STEP_SUMMARY")
         .context("GITHUB_STEP_SUMMARY isn't set: `--format github` is for GitHub Actions; try `--format markdown`")?;
     let markdown = markdown(config, evaluation, &summary)?;
@@ -62,9 +63,9 @@ fn markdown(config: &AsadocConfig, evaluation: &Evaluation, summary: &CheckSumma
     }
     writeln!(
         out,
-        "Code in this repo marked with `@code-as-a-doc:` comments has to match the code blocks in the docs, \
-         so that the docs and the code don't drift apart. Every code block in the docs has to match marked code \
-         or be ignored.\n"
+        "Code blocks in the docs are checked against the code in this repo they show, which is marked with \
+         `{MARKER_PREFIX}` comments. The code is tested and the docs aren't, so a doc block that no longer \
+         matches its code points at docs that may be out of date.\n"
     )?;
     for docs_description in &summary.docs_descriptions {
         writeln!(out, "Docs: {docs_description}  ")?;
@@ -269,7 +270,11 @@ fn write_unused(
             None => writeln!(out, "- {name}: no doc block resembles it")?,
         }
     }
-    writeln!(out, "\nIf the docs no longer show it, remove its markers.\n")?;
+    writeln!(
+        out,
+        "\nIf a marker is new, its code or options don't match the block it's for: see `asadoc check '<file>'`. \
+         If the docs no longer show it, remove its markers.\n"
+    )?;
     Ok(())
 }
 
@@ -301,14 +306,20 @@ fn write_problems(out: &mut String, summary: &CheckSummary) -> Result<()> {
 }
 
 fn write_next_steps(out: &mut String, summary: &CheckSummary) -> Result<()> {
-    writeln!(out, "### How to fix this\n")?;
+    writeln!(out, "### What to do\n")?;
     if summary.blocks_to_resolve() > 0 {
+        writeln!(out, "For each ❌ block:\n")?;
         writeln!(
             out,
-            "Resolve each ❌ block: make the repo code match it, or ignore it if it doesn't come from this repo. \
-             If the code is right and the docs are wrong, the docs need a fix; until then, the block stays \
-             unresolved.\n"
+            "- **The docs are out of date:** they need a fix. The block stays unresolved until the fix is in \
+             the docs this repo checks against."
         )?;
+        writeln!(
+            out,
+            "- **Only the form differs** (formatting, a value the docs write differently): make the code match, \
+             or cover it with an option on the marker."
+        )?;
+        writeln!(out, "- **The block doesn't show code from this repo:** ignore it.\n")?;
     }
     writeln!(out, "Locally, with [asadoc](https://github.com/omertuc/asadoc):\n")?;
     writeln!(out, "| Command | What it does |\n|---|---|")?;
@@ -331,67 +342,19 @@ fn write_next_steps(out: &mut String, summary: &CheckSummary) -> Result<()> {
     Ok(())
 }
 
-/// Annotations for the job log: on the code closest to each block still to
-/// resolve, on marked code no block matches, and on markers that can't be read
-fn print_annotations(config: &AsadocConfig, evaluation: &Evaluation, summary: &CheckSummary) {
-    for (_, block_eval) in evaluation.blocks().filter(|(_, block_eval)| !block_eval.done()) {
-        let reference = &block_eval.block.reference;
-        let Some(candidate) = block_eval.candidates.first() else {
-            println!(
-                "{}",
-                annotation(
-                    "error",
-                    None,
-                    "Doc block matches no code",
-                    &format!("No marked code resembles the doc block {reference}. See the job summary.")
-                )
-            );
-            continue;
-        };
-        let line_diff = LineDiff::new(&candidate.block_side, &candidate.content);
-        let message = match candidate.kind {
-            "lines" => format!(
-                "These lines would match the doc block {reference} if marked as a section. \
-                 See the job summary, or run `asadoc check '{reference}'`."
-            ),
-            _ => format!(
-                "The doc block {reference} doesn't match this code ({}). \
-                 See the job summary for the diff, or run `asadoc check '{reference}'`.",
-                check::describe_line_diff(line_diff)
-            ),
-        };
-        println!(
-            "{}",
-            annotation(
-                "error",
-                repo_location(config, &candidate.file, candidate.line_range, &candidate.marker_lines).as_ref(),
-                "Doesn't match the docs",
-                &message
-            )
-        );
-    }
-    for unused in &summary.unused_code {
-        let Some(marked_code) = find_marked(evaluation, &unused.name) else {
-            continue;
-        };
-        println!(
-            "{}",
-            annotation(
-                "warning",
-                repo_location(
-                    config,
-                    &marked_code.file,
-                    marked_code.line_range,
-                    &marked_code.marker_lines
-                )
-                .as_ref(),
-                "No doc block matches this",
-                "No doc block matches this marked code. If the docs no longer show it, remove its markers."
-            )
-        );
-    }
+/// Annotations for the job log, on markers in this repo that can't be read:
+/// the only thing a PR's diff is annotated with. Doc blocks that don't match
+/// are in the job summary only: the code isn't what's wrong, the docs may be.
+fn print_annotations(config: &AsadocConfig, summary: &CheckSummary) {
     for problem in &summary.problems {
-        let location = repo_location(config, &problem.file, None, &[]);
+        let location = config
+            .code_file(&problem.file)
+            .ok()
+            .filter(|(code_source, _)| code_source.name.is_none())
+            .map(|(_, path)| RepoLocation {
+                path,
+                line: problem_line(&problem.message),
+            });
         println!(
             "{}",
             annotation("error", location.as_ref(), "Marker can't be read", &problem.message)
@@ -399,24 +362,15 @@ fn print_annotations(config: &AsadocConfig, evaluation: &Evaluation, summary: &C
     }
 }
 
-/// A file in this repo and lines in it, for an annotation; None for other
-/// repos' files, which GitHub can't place
+/// A file in this repo and a line in it, for an annotation
 struct RepoLocation<'a> {
     path: &'a str,
-    lines: Option<(usize, usize)>,
+    line: Option<usize>,
 }
 
-fn repo_location<'a>(
-    config: &AsadocConfig,
-    file: &'a str,
-    line_range: Option<(usize, usize)>,
-    marker_lines: &[usize],
-) -> Option<RepoLocation<'a>> {
-    let (code_source, path) = config.code_file(file).ok()?;
-    code_source.name.is_none().then(|| RepoLocation {
-        path,
-        lines: line_range.or_else(|| marker_lines.first().map(|&line| (line, line))),
-    })
+/// The line a marker problem's message starts with, `line <n>: ...`
+fn problem_line(message: &str) -> Option<usize> {
+    message.strip_prefix("line ")?.split_once(':')?.0.parse().ok()
 }
 
 /// A GitHub workflow command that annotates a file, or the run
@@ -424,9 +378,8 @@ fn annotation(level: &str, location: Option<&RepoLocation<'_>>, title: &str, mes
     let mut properties = Vec::new();
     if let Some(location) = location {
         properties.push(format!("file={}", escape_property(location.path)));
-        if let Some((first_line, last_line)) = location.lines {
-            properties.push(format!("line={first_line}"));
-            properties.push(format!("endLine={last_line}"));
+        if let Some(line) = location.line {
+            properties.push(format!("line={line}"));
         }
     }
     properties.push(format!("title={}", escape_property(title)));
@@ -483,11 +436,17 @@ mod tests {
     fn annotations_escape_their_values() {
         let location = RepoLocation {
             path: "a,b:c.yaml",
-            lines: Some((3, 5)),
+            line: Some(3),
         };
         assert_eq!(
             annotation("error", Some(&location), "T: t", "50%\nmore"),
-            "::error file=a%2Cb%3Ac.yaml,line=3,endLine=5,title=T%3A t::50%25%0Amore"
+            "::error file=a%2Cb%3Ac.yaml,line=3,title=T%3A t::50%25%0Amore"
         );
+    }
+
+    #[test]
+    fn finds_the_line_of_a_marker_problem() {
+        assert_eq!(problem_line("line 12: unrecognized marker"), Some(12));
+        assert_eq!(problem_line("section \"s\": bad option"), None);
     }
 }
