@@ -10,7 +10,8 @@ use crate::config::AsadocConfig;
 use crate::eval::Evaluation;
 use crate::repo::{self, MarkerProblem};
 use crate::report::{
-    self, CheckOutcome, CheckSummary, Closest, FixOutcome, LineDiff, Sides, UnresolvedInAssembly, UnusedCode,
+    self, AwaitingFix, CheckOutcome, CheckSummary, Closest, FixOutcome, LineDiff, Sides, UnresolvedBlock,
+    UnresolvedInAssembly, UnusedCode,
 };
 use anyhow::{Context, Result};
 
@@ -103,16 +104,23 @@ pub(crate) fn print_summary(summary: &CheckSummary) {
     } else {
         ""
     };
+    let awaiting = if summary.awaiting_blocks > 0 {
+        format!(" {} a doc fix,", plural(summary.awaiting_blocks, "awaits", "await"))
+    } else {
+        String::new()
+    };
     println!(
-        "{}: {} match marked code{code_where}, {} are ignored, {blocks_to_resolve} {} still to resolve.",
+        "{}: {} match marked code{code_where}, {} are ignored,{awaiting} {blocks_to_resolve} {} still to resolve.",
         plural(summary.total_blocks, "doc code block", "doc code blocks"),
         summary.resolved_blocks,
         summary.ignored_blocks,
         if blocks_to_resolve == 1 { "is" } else { "are" }
     );
     summary.unresolved.iter().for_each(print_unresolved);
+    print_awaiting(&summary.awaiting);
     print_unused(&summary.unused_code);
     print_stale_ignored(&summary.stale_ignored);
+    print_stale_awaiting(&summary.stale_awaiting);
     print_problems(&summary.problems);
     print_next_steps(summary);
 }
@@ -120,18 +128,40 @@ pub(crate) fn print_summary(summary: &CheckSummary) {
 fn print_unresolved(assembly: &UnresolvedInAssembly) {
     print_heading(&assembly.title, &assembly.path);
     for block in &assembly.blocks {
-        println!("  ✗ {}", block.reference);
-        println!("      doc:     {}", block.location);
-        match &block.closest {
-            Some(closest_code) => println!("      closest: {}", describe_closest(closest_code)),
-            None => println!("      closest: no marked code resembles it"),
+        print_block("✗", block, 2);
+    }
+}
+
+/// A block no code matches, `depth` spaces in: where it is, and its closest code
+fn print_block(mark: &str, block: &UnresolvedBlock, depth: usize) {
+    println!("{}{mark} {}", " ".repeat(depth), block.reference);
+    let indent = " ".repeat(depth + 4);
+    println!("{indent}doc:     {}", block.location);
+    match &block.closest {
+        Some(closest_code) => println!("{indent}closest: {}", describe_closest(closest_code)),
+        None => println!("{indent}closest: no marked code resembles it"),
+    }
+    if let Some(fix_steps) = &block.fix_steps {
+        println!(
+            "{indent}fix:     `asadoc fix {}` would {}",
+            block.reference,
+            fix_steps.join(", then ")
+        );
+    }
+}
+
+fn print_awaiting(awaiting: &[AwaitingFix]) {
+    if awaiting.is_empty() {
+        return;
+    }
+    print_heading("Out of date, awaiting a doc fix", "");
+    for fix in awaiting {
+        println!("  {}", fix.name);
+        for line in fix.description.lines() {
+            println!("    {line}");
         }
-        if let Some(fix_steps) = &block.fix_steps {
-            println!(
-                "      fix:     `asadoc fix {}` would {}",
-                block.reference,
-                fix_steps.join(", then ")
-            );
+        for block in &fix.blocks {
+            print_block("~", block, 4);
         }
     }
 }
@@ -165,6 +195,19 @@ fn print_stale_ignored(stale_ignored: &[(String, String)]) {
     println!("  Delete its files from the ignore directory, or remove it in `asadoc serve`.");
 }
 
+fn print_stale_awaiting(stale_awaiting: &[(String, String)]) {
+    if stale_awaiting.is_empty() {
+        return;
+    }
+    print_heading("Awaiting a doc fix, but no doc block needs it anymore", "");
+    for (fix, first_line) in stale_awaiting {
+        println!("  - {fix}: {first_line}");
+    }
+    println!(
+        "  The docs changed, or the code matches them again: delete its files from the awaiting-doc-fix directory."
+    );
+}
+
 fn print_problems(problems: &[MarkerProblem]) {
     if problems.is_empty() {
         return;
@@ -187,19 +230,30 @@ pub(crate) fn list_todos(config: &AsadocConfig) -> Result<bool> {
 /// The all-clear, or what to do next
 fn print_next_steps(summary: &CheckSummary) {
     if summary.ok() {
-        println!("\n✓ Every doc code block matches marked code or is ignored.");
+        if summary.awaiting_blocks > 0 {
+            println!("\n✓ Every doc code block matches marked code, is ignored, or awaits a doc fix.");
+        } else {
+            println!("\n✓ Every doc code block matches marked code or is ignored.");
+        }
         return;
     }
     println!();
     if summary.blocks_to_resolve() > 0 {
-        println!("Resolve each ✗ block: make repo code match it, or ignore it if it doesn't come from this repo.");
+        println!(
+            "Resolve each ✗ block: make repo code match it, ignore it if it doesn't come from this repo, or, if \
+             the docs are out of date, have it await a doc fix."
+        );
     }
     println!("  asadoc check <block>   how a block differs from its closest code");
     println!("  asadoc check <file>    how marked code differs from its closest doc block");
     if summary.fixable_blocks() > 0 {
         println!("  asadoc fix <block>     make the change listed under the block");
     }
-    println!("  asadoc guide           how markers and ignoring work");
+    if summary.blocks_to_resolve() > 0 {
+        println!("  asadoc await-doc-fix <block> --fix <name> --description <text>");
+        println!("                         have it await a fix to the docs");
+    }
+    println!("  asadoc guide           how markers, ignoring and awaiting doc fixes work");
 }
 
 /// `asadoc check <names>`: false unless everything given is resolved or ignored
@@ -213,6 +267,21 @@ fn print_outcome(outcome: &CheckOutcome) {
     match outcome {
         CheckOutcome::NotFound { name } => println!("✗ {name}: no doc block or marked code by that name"),
         CheckOutcome::Ignored { reference, reason } => println!("✓ {reference}: ignored ({reason})"),
+        CheckOutcome::AwaitingDocFix {
+            reference,
+            location,
+            fix,
+            closest,
+        } => match closest {
+            Some((closest_code, sides)) => {
+                println!(
+                    "~ {reference} ({location}): awaiting the doc fix {fix}; until then the closest code is {}",
+                    describe_closest(closest_code)
+                );
+                print_diff(sides);
+            }
+            None => println!("~ {reference} ({location}): awaiting the doc fix {fix}; no marked code resembles it"),
+        },
         CheckOutcome::Resolved {
             reference,
             matched_codes,
@@ -307,4 +376,19 @@ pub(crate) fn fix(config: &AsadocConfig, reference: &str) -> Result<bool> {
         }
     }
     Ok(outcome.ok())
+}
+
+/// `asadoc await-doc-fix <blocks> --fix <name>`
+pub(crate) fn await_doc_fix(
+    config: &AsadocConfig,
+    blocks: &[String],
+    fix: &str,
+    description: Option<&str>,
+) -> Result<bool> {
+    let working_dir = env::current_dir().context("finding the working directory")?;
+    for (reference, path) in report::await_doc_fix(config, blocks, fix, description)? {
+        let shown_path = path.strip_prefix(&working_dir).unwrap_or(&path);
+        println!("~ {reference}: awaiting the doc fix {fix} ({})", shown_path.display());
+    }
+    Ok(true)
 }

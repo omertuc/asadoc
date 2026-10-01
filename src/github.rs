@@ -49,7 +49,13 @@ pub(crate) fn report(config: &AsadocConfig, evaluation: &Evaluation) -> Result<b
 fn markdown(config: &AsadocConfig, evaluation: &Evaluation, summary: &CheckSummary) -> Result<String> {
     let mut out = String::new();
     let blocks_to_resolve = summary.blocks_to_resolve();
-    if summary.ok() {
+    if summary.ok() && summary.awaiting_blocks > 0 {
+        writeln!(
+            out,
+            "## ✅ The docs' code blocks match this repo's code, apart from {} awaiting a doc fix\n",
+            summary.awaiting_blocks
+        )?;
+    } else if summary.ok() {
         writeln!(out, "## ✅ The docs' code blocks match this repo's code\n")?;
     } else if blocks_to_resolve > 0 {
         writeln!(
@@ -70,19 +76,24 @@ fn markdown(config: &AsadocConfig, evaluation: &Evaluation, summary: &CheckSumma
     for docs_description in &summary.docs_descriptions {
         writeln!(out, "Docs: {docs_description}  ")?;
     }
-    writeln!(out, "\n| Code blocks | ✅ Match code | ➖ Ignored | ❌ To resolve |")?;
-    writeln!(out, "|---:|---:|---:|---:|")?;
     writeln!(
         out,
-        "| {} | {} | {} | {blocks_to_resolve} |\n",
-        summary.total_blocks, summary.resolved_blocks, summary.ignored_blocks,
+        "\n| Code blocks | ✅ Match code | ➖ Ignored | ⏳ Awaiting doc fix | ❌ To resolve |"
+    )?;
+    writeln!(out, "|---:|---:|---:|---:|---:|")?;
+    writeln!(
+        out,
+        "| {} | {} | {} | {} | {blocks_to_resolve} |\n",
+        summary.total_blocks, summary.resolved_blocks, summary.ignored_blocks, summary.awaiting_blocks,
     )?;
 
     for assembly_eval in &evaluation.assemblies {
         write_assembly(&mut out, config, evaluation, assembly_eval)?;
     }
+    write_awaiting(&mut out, config, evaluation, summary)?;
     write_unused(&mut out, config, evaluation, summary)?;
     write_stale_ignored(&mut out, summary)?;
+    write_stale_awaiting(&mut out, summary)?;
     write_problems(&mut out, summary)?;
     if !summary.ok() {
         write_next_steps(&mut out, summary)?;
@@ -118,28 +129,66 @@ fn write_assembly(
     writeln!(out, "### {}\n", assembly.title)?;
     writeln!(out, "<sub>{assembly_path}</sub>\n")?;
     for block_eval in unresolved_blocks {
-        let doc_link = docs_links
-            .map(|links| links.source_line(&docs::module_path(&block_eval.block.module), block_eval.block.line));
-        write_block(out, config, evaluation, block_eval, doc_link.as_deref())?;
+        write_block(out, config, evaluation, assembly_eval, block_eval, "❌")?;
     }
     Ok(())
 }
 
-/// One block still to resolve: what it is, its closest code, and a collapsed diff
+/// The blocks awaiting each doc fix, under what the fix is
+fn write_awaiting(
+    out: &mut String,
+    config: &AsadocConfig,
+    evaluation: &Evaluation,
+    summary: &CheckSummary,
+) -> Result<()> {
+    if summary.awaiting.is_empty() {
+        return Ok(());
+    }
+    writeln!(out, "### ⏳ Out of date, awaiting a doc fix\n")?;
+    writeln!(
+        out,
+        "The code changed and the docs are still to follow. These don't fail the check until their content \
+         changes.\n"
+    )?;
+    for fix in &summary.awaiting {
+        writeln!(out, "#### `{}`\n", fix.name)?;
+        if !fix.description.is_empty() {
+            writeln!(out, "{}\n", fix.description)?;
+        }
+        for (assembly_eval, block_eval) in evaluation
+            .blocks()
+            .filter(|(_, block_eval)| block_eval.awaiting_doc_fix.as_deref() == Some(fix.name.as_str()))
+        {
+            write_block(out, config, evaluation, assembly_eval, block_eval, "⏳")?;
+        }
+    }
+    Ok(())
+}
+
+/// One block no code matches: what it is, its closest code, and a collapsed diff
 fn write_block(
     out: &mut String,
     config: &AsadocConfig,
     evaluation: &Evaluation,
+    assembly_eval: &AssemblyEval,
     block_eval: &BlockEval,
-    doc_link: Option<&str>,
+    mark: &str,
 ) -> Result<()> {
     let block = &block_eval.block;
-    let reference = html_link(&format!("<code>{}</code>", escape_html(&block.reference)), doc_link);
+    let doc_link = config
+        .docs
+        .get(assembly_eval.assembly.docs_index)
+        .and_then(|docs| docs.links.as_ref())
+        .map(|links| links.source_line(&docs::module_path(&block.module), block.line));
+    let reference = html_link(
+        &format!("<code>{}</code>", escape_html(&block.reference)),
+        doc_link.as_deref(),
+    );
     let closest = match block_eval.candidates.first() {
         Some(candidate) => format!("closest code: {}", describe_candidate(config, candidate)),
         None => "no marked code resembles it".to_owned(),
     };
-    writeln!(out, "<details>\n<summary>❌ {reference} — {closest}</summary>\n")?;
+    writeln!(out, "<details>\n<summary>{mark} {reference} — {closest}</summary>\n")?;
     let context = [block.section.as_deref(), block.lead.as_deref()]
         .into_iter()
         .flatten()
@@ -163,9 +212,16 @@ fn write_block(
                 writeln!(out, "How the doc block (`-`) differs from the code (`+`):\n")?;
                 write_diff(out, sides, &block.reference)?;
             }
-            CheckOutcome::NothingResembles { block_content, .. } => {
+            CheckOutcome::AwaitingDocFix {
+                closest: Some((_, sides)),
+                ..
+            } => {
+                writeln!(out, "How the doc block (`-`) differs from the code (`+`):\n")?;
+                write_diff(out, sides, &block.reference)?;
+            }
+            CheckOutcome::NothingResembles { .. } | CheckOutcome::AwaitingDocFix { closest: None, .. } => {
                 writeln!(out, "The doc block:\n")?;
-                write_fenced(out, &block.language, block_content)?;
+                write_fenced(out, &block.language, &block.content)?;
             }
             _ => {}
         }
@@ -293,6 +349,22 @@ fn write_stale_ignored(out: &mut String, summary: &CheckSummary) -> Result<()> {
     Ok(())
 }
 
+fn write_stale_awaiting(out: &mut String, summary: &CheckSummary) -> Result<()> {
+    if summary.stale_awaiting.is_empty() {
+        return Ok(());
+    }
+    writeln!(out, "### ⚠️ Awaiting a doc fix, but no doc block needs it anymore\n")?;
+    for (fix, first_line) in &summary.stale_awaiting {
+        writeln!(out, "- `{fix}`: `{}`", first_line.replace('`', "'"))?;
+    }
+    writeln!(
+        out,
+        "\nThe docs changed, or the code matches them again: delete its files from the awaiting-doc-fix \
+         directory.\n"
+    )?;
+    Ok(())
+}
+
 fn write_problems(out: &mut String, summary: &CheckSummary) -> Result<()> {
     if summary.problems.is_empty() {
         return Ok(());
@@ -311,8 +383,10 @@ fn write_next_steps(out: &mut String, summary: &CheckSummary) -> Result<()> {
         writeln!(out, "For each ❌ block:\n")?;
         writeln!(
             out,
-            "- **The docs are out of date:** they need a fix. The block stays unresolved until the fix is in \
-             the docs this repo checks against."
+            "- **The docs are out of date:** they need a fix. Until it's in the docs this repo checks against, \
+             have the block await it: `asadoc await-doc-fix '<block>' --fix <name> --description '<what the \
+             docs need to change, and where that's tracked>'`, and commit what it adds to \
+             `.asadoc/awaiting-doc-fix/`."
         )?;
         writeln!(
             out,
@@ -338,7 +412,10 @@ fn write_next_steps(out: &mut String, summary: &CheckSummary) -> Result<()> {
         )?;
     }
     writeln!(out, "| `asadoc serve` | Review every block in a web UI |")?;
-    writeln!(out, "| `asadoc guide` | How markers and ignoring work |\n")?;
+    writeln!(
+        out,
+        "| `asadoc guide` | How markers, ignoring and awaiting doc fixes work |\n"
+    )?;
     Ok(())
 }
 

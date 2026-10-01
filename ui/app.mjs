@@ -7,14 +7,15 @@ const asciidoctor = Asciidoctor();
 // A queue of doc blocks that no marked repo code matches yet. Each one gets
 // resolved by making some code match it (by hand, by an AI assistant, or with
 // a lightbulb fix), or ignored when no repo code should match it. Resolved and
-// ignored blocks, and all marked code, can be browsed too.
+// ignored blocks, blocks awaiting a fix to the docs, and all marked code, can
+// be browsed too.
 
 let data = null;
 let selectedKey = null;   // `${asm}:${ref}`
-let tab = 'todo';         // 'todo' | 'resolved' | 'ignored' | 'code' | 'todos'
+let tab = 'todo';         // 'todo' | 'resolved' | 'ignored' | 'awaiting' | 'code' | 'todos'
 // The tabs, under their category's title
 const CATEGORIES = [
-  { label: 'Doc code blocks', tabs: ['todo', 'resolved', 'ignored'] },
+  { label: 'Doc code blocks', tabs: ['todo', 'resolved', 'ignored', 'awaiting'] },
   { label: 'Code', tabs: ['code'] },
   { label: 'Comments', tabs: ['todos'] },
 ];
@@ -77,8 +78,23 @@ function ignoredBlocks() {
   return data.guides.flatMap(g => g.ignored);
 }
 
+function awaitingBlocks() {
+  return data.guides.flatMap(g => g.awaiting);
+}
+
 function tabBlocks() {
-  return { todo: allBlocks, resolved: resolvedBlocks, ignored: ignoredBlocks, code: () => data.code, todos: todoCode }[tab]();
+  return { todo: allBlocks, resolved: resolvedBlocks, ignored: ignoredBlocks, awaiting: awaitingBlocks, code: () => data.code, todos: todoCode }[tab]();
+}
+
+// The tab a doc block is in
+function tabOf(key) {
+  const has = list => list.some(b => keyOf(b) === key);
+  return has(allBlocks()) ? 'todo' : has(resolvedBlocks()) ? 'resolved' : has(ignoredBlocks()) ? 'ignored' : has(awaitingBlocks()) ? 'awaiting' : null;
+}
+
+// A doc fix's README.md, as written
+function docFixDescription(name) {
+  return data.docFixes.find(f => f.name === name)?.description || '';
 }
 
 // The marked code with TODOs, in the order of their first TODO
@@ -112,12 +128,13 @@ function reasonName(typed) {
 // How a resolved block is resolved, in a few words
 function howResolved(b) {
   if (b.ignoredAs) return reasonLabel(b.ignoredAs);
+  if (b.awaitingDocFix) return `Awaits ${b.awaitingDocFix}`;
   return codeName(b.code[0]) + (b.code.length > 1 ? ` (+${b.code.length - 1} more)` : '');
 }
 
 function matchesQuery(b) {
   if (!query) return true;
-  const hay = [b.ref, b.content, b.section, b.ignoredAs, b.file, b.snippet, ...(Array.isArray(b.code) ? b.code : []).map(codeName),
+  const hay = [b.ref, b.content, b.section, b.ignoredAs, b.awaitingDocFix, b.file, b.snippet, ...(Array.isArray(b.code) ? b.code : []).map(codeName),
     ...(b.candidates || []).map(c => `${c.file} ${c.name || ''}`)].join('\n').toLowerCase();
   return hay.includes(query);
 }
@@ -128,13 +145,13 @@ function visibleBlocks() {
 }
 
 function selectedBlock() {
-  return [...allBlocks(), ...resolvedBlocks(), ...ignoredBlocks(), ...data.code].find(b => keyOf(b) === selectedKey) || null;
+  return [...allBlocks(), ...resolvedBlocks(), ...ignoredBlocks(), ...awaitingBlocks(), ...data.code].find(b => keyOf(b) === selectedKey) || null;
 }
 
 // Opens a doc block, in whichever tab it is
 function goToBlock(asm, ref) {
   const key = `${asm}:${ref}`;
-  tab = allBlocks().some(b => keyOf(b) === key) ? 'todo' : resolvedBlocks().some(b => keyOf(b) === key) ? 'resolved' : 'ignored';
+  tab = tabOf(key) || 'todo';
   select(key);
 }
 
@@ -408,19 +425,18 @@ async function act(path, body, button) {
 // Re-reads both repos. When the block on screen got resolved meanwhile (by an
 // edit elsewhere), says so and moves on to the one that took its place.
 async function rescan() {
-  const listState = () => JSON.stringify([allBlocks().map(keyOf), resolvedBlocks().map(b => [keyOf(b), howResolved(b)]), ignoredBlocks().map(b => [keyOf(b), b.ignoredAs]), data.staleIgnored, data.code.map(c => [c.id, c.matchedBy.length]), data.problems, data.todos]);
+  const listState = () => JSON.stringify([allBlocks().map(keyOf), resolvedBlocks().map(b => [keyOf(b), howResolved(b)]), ignoredBlocks().map(b => [keyOf(b), b.ignoredAs]), awaitingBlocks().map(b => [keyOf(b), b.awaitingDocFix]), data.staleIgnored, data.staleAwaiting, data.code.map(c => [c.id, c.matchedBy.length]), data.problems, data.todos]);
   const before = visibleBlocks();
   const idx = before.findIndex(b => keyOf(b) === selectedKey);
-  const shown = () => JSON.stringify([selectedBlock(), data.ignoreReasons]);
+  const shown = () => JSON.stringify([selectedBlock(), data.ignoreReasons, data.docFixes]);
   const shownBefore = shown();
   const queueBefore = listState();
   await load();
   const blocks = visibleBlocks();
   if (selectedKey && idx !== -1 && !blocks.some(b => keyOf(b) === selectedKey)) {
-    // A resolved or ignored block that moved to another tab: follow it there
-    if (tab === 'resolved' || tab === 'ignored') {
-      const has = list => list.some(b => keyOf(b) === selectedKey);
-      const now = has(allBlocks()) ? 'todo' : has(resolvedBlocks()) ? 'resolved' : has(ignoredBlocks()) ? 'ignored' : null;
+    // A resolved, ignored or awaiting block that moved to another tab: follow it there
+    if (tab === 'resolved' || tab === 'ignored' || tab === 'awaiting') {
+      const now = tabOf(selectedKey);
       if (now) { tab = now; select(selectedKey); return; }
     }
     toast(tab === 'todo' ? `✓ ${selectedKey.split(':')[1]} is resolved`
@@ -453,7 +469,8 @@ function renderQueue() {
   headEl.querySelector('button').addEventListener('click', rescan);
   const tabLabels = {
     todo: ['To resolve', remaining], resolved: ['Resolved', resolvedBlocks().length],
-    ignored: ['Ignored', ignoredBlocks().length], code: ['Marked code', data.code.length],
+    ignored: ['Ignored', ignoredBlocks().length], awaiting: ['Awaiting', awaitingBlocks().length],
+    code: ['Marked code', data.code.length],
     todos: ['TODOs', data.todos.length],
   };
   queueEl.querySelector('.tabs').innerHTML = CATEGORIES.map(c => `
@@ -466,7 +483,7 @@ function renderQueue() {
   if (tab === 'todos') { renderTodoList(list); return; }
   let shown = 0;
   for (const g of data.guides) {
-    const blocks = { todo: g.blocks, resolved: g.resolved, ignored: g.ignored }[tab].filter(matchesQuery);
+    const blocks = { todo: g.blocks, resolved: g.resolved, ignored: g.ignored, awaiting: g.awaiting }[tab].filter(matchesQuery);
     if (!blocks.length) continue;
     list.appendChild(el('div', 'guide', `<span>${esc(guideLabel(g))}</span><span class="count">${blocks.length}</span>`));
     for (const b of blocks) {
@@ -486,7 +503,7 @@ function renderQueue() {
   }
   if (!shown) {
     list.appendChild(el('div', query ? 'note' : 'all-done',
-      query ? 'Nothing matches the search.' : { todo: 'Every doc block is resolved or ignored.', resolved: 'Nothing is resolved yet.', ignored: 'Nothing is ignored.' }[tab]));
+      query ? 'Nothing matches the search.' : { todo: 'Every doc block is resolved, ignored or awaiting a doc fix.', resolved: 'Nothing is resolved yet.', ignored: 'Nothing is ignored.', awaiting: 'No doc block is awaiting a doc fix.' }[tab]));
   }
   if (tab !== 'todo') return;
 
@@ -498,6 +515,18 @@ function renderQueue() {
       row.innerHTML = `<span><code>${esc(preview(c.content))}</code><br><span class="muted">${esc(reasonLabel(c.reason))}</span></span>`;
       const del = el('button', 'link', 'Remove');
       del.addEventListener('click', () => act('/api/remove-ignored', { content: c.content }, del));
+      row.appendChild(del);
+      list.appendChild(row);
+    }
+  }
+  if (data.staleAwaiting.length) {
+    list.appendChild(el('div', 'guide aux', `Stale awaiting-doc-fix entries <span class="count">${data.staleAwaiting.length}</span>`));
+    list.appendChild(el('div', 'note', 'Content awaiting a doc fix that no doc block needs anymore: the docs changed, or the code matches them again.'));
+    for (const c of data.staleAwaiting) {
+      const row = el('div', 'aux-row');
+      row.innerHTML = `<span><code>${esc(preview(c.content))}</code><br><span class="muted">${esc(c.fix)}</span></span>`;
+      const del = el('button', 'link', 'Remove');
+      del.addEventListener('click', () => act('/api/remove-awaiting', { content: c.content }, del));
       row.appendChild(del);
       list.appendChild(row);
     }
@@ -879,6 +908,18 @@ function renderBlock() {
 
   showDocPreview(b);
 
+  // Out of date: the code changed and the docs are still to follow
+  if (b.awaitingDocFix) {
+    const note = el('div', 'previous awaiting', `⏳ Out of date, awaiting the doc fix <b>${esc(b.awaitingDocFix)}</b>. It doesn't fail <code>asadoc check</code> until its content changes. `);
+    const btn = el('button', 'link inline', 'Stop awaiting');
+    btn.title = 'Delete its file from .asadoc/awaiting-doc-fix/ and send it back to the queue';
+    btn.addEventListener('click', () => act('/api/unawait', { asm: b.asm, ref: b.ref }, btn));
+    note.appendChild(btn);
+    const description = docFixDescription(b.awaitingDocFix);
+    if (description) note.appendChild(el('pre', 'fix-description', esc(description)));
+    blockEl.appendChild(note);
+  }
+
   // An ignored block whose content changed: offer to ignore the new content in its place
   for (const f of b.formerly || []) {
     const note = el('div', 'previous', `💡 This looks like a block ignored as <b>${esc(reasonLabel(f.reason))}</b> before it changed. `);
@@ -1052,6 +1093,7 @@ async function untilReady() {
   const fromHash = decodeURIComponent(location.hash.slice(1));
   if (resolvedBlocks().some(b => keyOf(b) === fromHash)) tab = 'resolved';
   if (ignoredBlocks().some(b => keyOf(b) === fromHash)) tab = 'ignored';
+  if (awaitingBlocks().some(b => keyOf(b) === fromHash)) tab = 'awaiting';
   if (data.code.some(c => keyOf(c) === fromHash)) tab = 'code';
   selectedKey = tabBlocks().some(b => keyOf(b) === fromHash) ? fromHash : (tabBlocks()[0] ? keyOf(tabBlocks()[0]) : null);
   renderQueue();

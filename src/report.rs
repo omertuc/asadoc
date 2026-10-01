@@ -2,9 +2,11 @@
 //! evaluation here, printed by `check`.
 
 use std::collections::HashSet;
+use std::path::PathBuf;
 
 use similar::{ChangeTag, TextDiff};
 
+use crate::awaiting::AwaitingDocFixes;
 use crate::config::{AsadocConfig, CodeSource, Docs};
 use crate::eval::{self, AssemblyEval, BlockEval, CandidateInfo, CodeMatch, Evaluation};
 use crate::lightbulb;
@@ -83,6 +85,15 @@ pub(crate) struct UnresolvedInAssembly {
     pub blocks: Vec<UnresolvedBlock>,
 }
 
+/// The blocks awaiting one doc fix
+#[derive(Debug)]
+pub(crate) struct AwaitingFix {
+    pub name: String,
+    /// What the docs need to change (its `README.md`)
+    pub description: String,
+    pub blocks: Vec<UnresolvedBlock>,
+}
+
 /// Marked code no doc block matches
 #[derive(Debug)]
 pub(crate) struct UnusedCode {
@@ -101,19 +112,24 @@ pub(crate) struct CheckSummary {
     pub total_blocks: usize,
     pub resolved_blocks: usize,
     pub ignored_blocks: usize,
+    pub awaiting_blocks: usize,
     /// Blocks to resolve, by assembly
     pub unresolved: Vec<UnresolvedInAssembly>,
+    /// Blocks awaiting a doc fix, by fix
+    pub awaiting: Vec<AwaitingFix>,
     /// Marked code no block matches that isn't any block's closest code
     pub unused_code: Vec<UnusedCode>,
     /// (reason, first line) of ignored content no block has anymore
     pub stale_ignored: Vec<(String, String)>,
+    /// (doc fix, first line) of awaiting content no unmatched block has anymore
+    pub stale_awaiting: Vec<(String, String)>,
     pub problems: Vec<MarkerProblem>,
 }
 
 impl CheckSummary {
     pub(crate) const fn blocks_to_resolve(&self) -> usize {
         self.total_blocks
-            .saturating_sub(self.resolved_blocks + self.ignored_blocks)
+            .saturating_sub(self.resolved_blocks + self.ignored_blocks + self.awaiting_blocks)
     }
     pub(crate) fn fixable_blocks(&self) -> usize {
         self.unresolved
@@ -197,6 +213,7 @@ impl CheckSummary {
             .iter()
             .filter_map(|assembly_eval| unresolved_in_assembly(asadoc_config, assembly_eval))
             .collect();
+        let awaiting = awaiting_by_fix(evaluation);
         let shown_code_ids = shown_code_ids(evaluation);
         let unused_code = evaluation
             .unused_marked_indexes
@@ -222,7 +239,12 @@ impl CheckSummary {
                 .blocks()
                 .filter(|(_, block_eval)| block_eval.ignored_as.is_some())
                 .count(),
+            awaiting_blocks: evaluation
+                .blocks()
+                .filter(|(_, block_eval)| block_eval.awaiting_doc_fix.is_some())
+                .count(),
             unresolved,
+            awaiting,
             unused_code,
             stale_ignored: evaluation
                 .stale_ignored
@@ -231,9 +253,45 @@ impl CheckSummary {
                     (reason.clone(), ignored_content.lines().next().unwrap_or("").to_owned())
                 })
                 .collect(),
+            stale_awaiting: evaluation
+                .stale_awaiting
+                .iter()
+                .map(|entry| (entry.fix.clone(), entry.content.lines().next().unwrap_or("").to_owned()))
+                .collect(),
             problems: evaluation.scan.problems.clone(),
         })
     }
+}
+
+/// A block no code matches, with its closest code
+fn unresolved_block(block_eval: &BlockEval) -> UnresolvedBlock {
+    let top_candidate = block_eval.candidates.first();
+    UnresolvedBlock {
+        reference: block_eval.block.reference.clone(),
+        location: block_location(block_eval),
+        closest: top_candidate.map(closest_from_candidate),
+        fix_steps: top_candidate.and_then(fix_steps),
+    }
+}
+
+/// The blocks awaiting each doc fix, for the fixes some block awaits
+fn awaiting_by_fix(evaluation: &Evaluation) -> Vec<AwaitingFix> {
+    evaluation
+        .doc_fixes
+        .iter()
+        .filter_map(|doc_fix| {
+            let blocks: Vec<UnresolvedBlock> = evaluation
+                .blocks()
+                .filter(|(_, block_eval)| block_eval.awaiting_doc_fix.as_deref() == Some(doc_fix.name.as_str()))
+                .map(|(_, block_eval)| unresolved_block(block_eval))
+                .collect();
+            (!blocks.is_empty()).then(|| AwaitingFix {
+                name: doc_fix.name.clone(),
+                description: doc_fix.description.clone(),
+                blocks,
+            })
+        })
+        .collect()
 }
 
 /// The blocks of an assembly still to resolve; None when there are none
@@ -242,15 +300,7 @@ fn unresolved_in_assembly(asadoc_config: &AsadocConfig, assembly_eval: &Assembly
         .blocks
         .iter()
         .filter(|block_eval| !block_eval.done())
-        .map(|block_eval| {
-            let top_candidate = block_eval.candidates.first();
-            UnresolvedBlock {
-                reference: block_eval.block.reference.clone(),
-                location: block_location(block_eval),
-                closest: top_candidate.map(closest_from_candidate),
-                fix_steps: top_candidate.and_then(fix_steps),
-            }
-        })
+        .map(unresolved_block)
         .collect();
     (!unresolved_blocks.is_empty()).then(|| UnresolvedInAssembly {
         title: assembly_eval.assembly.title.clone(),
@@ -262,11 +312,12 @@ fn unresolved_in_assembly(asadoc_config: &AsadocConfig, assembly_eval: &Assembly
     })
 }
 
-/// The ids of the code shown as the closest of some block still to resolve
+/// The ids of the code shown as the closest of some block awaiting a doc fix
+/// or still to resolve
 fn shown_code_ids(evaluation: &Evaluation) -> HashSet<String> {
     evaluation
         .blocks()
-        .filter(|(_, block_eval)| !block_eval.done())
+        .filter(|(_, block_eval)| block_eval.unmatched())
         .filter_map(|(_, block_eval)| block_eval.candidates.first())
         .map(|candidate| candidate.id.clone())
         .collect()
@@ -306,6 +357,14 @@ pub(crate) enum CheckOutcome {
     Ignored {
         reference: String,
         reason: String,
+    },
+    /// The block is out of date; until the docs are fixed it differs from its
+    /// closest code (when any resembles it) like this
+    AwaitingDocFix {
+        reference: String,
+        location: String,
+        fix: String,
+        closest: Option<(Closest, Sides)>,
     },
     Resolved {
         reference: String,
@@ -353,7 +412,7 @@ impl CheckOutcome {
     pub(crate) const fn ok(&self) -> bool {
         matches!(
             self,
-            Self::Ignored { .. } | Self::Resolved { .. } | Self::CodeMatches { .. }
+            Self::Ignored { .. } | Self::AwaitingDocFix { .. } | Self::Resolved { .. } | Self::CodeMatches { .. }
         )
     }
 }
@@ -494,7 +553,21 @@ fn block_outcome(evaluation: &Evaluation, block_eval: &BlockEval) -> Result<Chec
             placeholder_values: first_match.values.clone(),
         });
     }
-    let Some(top_candidate) = block_eval.candidates.first() else {
+    let top_candidate = block_eval.candidates.first();
+    if let Some(fix) = &block_eval.awaiting_doc_fix {
+        return Ok(CheckOutcome::AwaitingDocFix {
+            reference,
+            location: block_location(block_eval),
+            fix: fix.clone(),
+            closest: top_candidate.map(|candidate| {
+                (
+                    closest_from_candidate(candidate),
+                    candidate_sides(block_eval, candidate),
+                )
+            }),
+        });
+    }
+    let Some(top_candidate) = top_candidate else {
         return Ok(CheckOutcome::NothingResembles {
             reference,
             location: block_location(block_eval),
@@ -506,16 +579,21 @@ fn block_outcome(evaluation: &Evaluation, block_eval: &BlockEval) -> Result<Chec
         location: block_location(block_eval),
         closest: closest_from_candidate(top_candidate),
         fix_steps: fix_steps(top_candidate),
-        sides: Sides {
-            doc_text: top_candidate.block_side.clone(),
-            doc_label: doc_label(block_eval, !top_candidate.doc_options.is_empty()),
-            code_text: top_candidate.content.clone(),
-            code_label: code_label(
-                &code_name(&top_candidate.file, top_candidate.section_name.as_deref()),
-                !top_candidate.options.is_empty(),
-            ),
-        },
+        sides: candidate_sides(block_eval, top_candidate),
     })
+}
+
+/// A block next to a candidate, for a diff
+fn candidate_sides(block_eval: &BlockEval, candidate: &CandidateInfo) -> Sides {
+    Sides {
+        doc_text: candidate.block_side.clone(),
+        doc_label: doc_label(block_eval, !candidate.doc_options.is_empty()),
+        code_text: candidate.content.clone(),
+        code_label: code_label(
+            &code_name(&candidate.file, candidate.section_name.as_deref()),
+            !candidate.options.is_empty(),
+        ),
+    }
 }
 
 fn code_outcome(evaluation: &Evaluation, marked_code: &MarkedCode) -> Result<CheckOutcome> {
@@ -570,7 +648,7 @@ pub(crate) fn fix(config: &AsadocConfig, name: &str) -> Result<FixOutcome> {
         .find_named(name)
         .with_context(|| format!("no doc block {name} in the configured assemblies"))?;
     let reference = block_eval.block.reference.as_str();
-    if block_eval.done() {
+    if !block_eval.unmatched() {
         return Ok(FixOutcome::AlreadyDone);
     }
     let Some((candidate, plan)) = block_eval
@@ -591,4 +669,53 @@ pub(crate) fn fix(config: &AsadocConfig, name: &str) -> Result<FixOutcome> {
             .blocks()
             .any(|(_, block_eval)| block_eval.block.reference == reference && block_eval.resolved()),
     })
+}
+
+/// `asadoc await-doc-fix`: makes doc blocks await the doc fix `fix`, adding it
+/// (meaning `description`) when it's new. Returns each block's reference and
+/// the file that now holds its content
+pub(crate) fn await_doc_fix(
+    config: &AsadocConfig,
+    names: &[String],
+    fix: &str,
+    description: Option<&str>,
+) -> Result<Vec<(String, PathBuf)>> {
+    let evaluation = eval::evaluate(config, false).context("evaluating the doc blocks")?;
+    let block_evals = names
+        .iter()
+        .map(|name| {
+            let block_eval = evaluation
+                .find_named(name)
+                .with_context(|| format!("no doc block {name} in the configured assemblies"))?;
+            if block_eval.resolved() {
+                bail!("{name} matches marked code, so it isn't out of date");
+            }
+            if let Some(reason) = &block_eval.ignored_as {
+                bail!("{name} is ignored as {reason}, so no code has to match it");
+            }
+            Ok(block_eval)
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut awaiting = AwaitingDocFixes::load(&config.awaiting_doc_fix_dir)
+        .with_context(|| format!("loading {}", config.awaiting_doc_fix_dir.display()))?;
+    let is_known_fix = awaiting.fixes.iter().any(|known_fix| known_fix.name == fix);
+    match (is_known_fix, description) {
+        (false, Some(description)) => awaiting.add_fix(fix, description)?,
+        (false, None) => bail!(
+            "there's no doc fix {fix} yet: add it with --description, saying what the docs need to change and \
+             where that change is tracked"
+        ),
+        (true, Some(_)) => bail!("the doc fix {fix} already exists; to change its description, edit its README.md"),
+        (true, None) => {}
+    }
+    block_evals
+        .into_iter()
+        .map(|block_eval| {
+            let reference = &block_eval.block.reference;
+            let path = awaiting
+                .await_fix(&block_eval.block.content, fix, reference)
+                .with_context(|| format!("making {reference} await {fix}"))?;
+            Ok((reference.clone(), path))
+        })
+        .collect()
 }

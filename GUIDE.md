@@ -117,7 +117,8 @@ itself.
 
 The point is to find drift, not to make `asadoc check` pass. If the doc or the
 code is actually wrong, or matching them would mean changing what the code does,
-leave the block unresolved and report it.
+leave the block unresolved and report it (or, once it's settled that the docs
+are wrong, have it await a doc fix: see below).
 
 1. Change the code where that doesn't make it worse. Arbitrary formatting
    (indentation, key order) can just match the doc. Code embedded in other code,
@@ -154,12 +155,45 @@ means (a `README.md` in a built-in reason directory replaces its description):
 Each file holds the block's content to ignore verbatim. File names are
 arbitrary: one file covers every block which has the same content as it.
 
-## Resolved, ignored, to resolve
+## Awaiting a doc fix
+
+When the code changes on purpose and a doc block it matched is now out of date,
+the docs need a fix, which can take a while to land. Until then, the block can
+**await a doc fix** instead of failing `asadoc check`:
+
+```bash
+asadoc await-doc-fix '<block>' --fix pull-secret-type \
+  --description 'The docs should create the pull secret with --type=kubernetes.io/dockerconfigjson.
+Tracked in https://github.com/openshift/openshift-docs/pull/12345'
+```
+
+This puts the block's exact content in a file under
+`.asadoc/awaiting-doc-fix/<fix>/` (`.asadoc/awaiting-doc-fix` configurable
+through `awaiting_doc_fix_dir`). Each subdirectory is one doc fix, and its
+`README.md` (the `--description`) says what the docs need to change and where
+that change is tracked. Several blocks can await the same fix: give them all, or
+give `--fix` again without `--description` to add another one later.
+
+`asadoc check` passes with blocks awaiting a doc fix, but still lists them,
+with how each differs from its closest code. The entry only covers the content
+the block had: once the docs change (and `ref` is moved to include the change),
+the block is checked against the code again. Its old entry is then reported as
+no longer needed, and its files can be deleted. The same happens when the code
+matches the block again.
+
+Only have a block await a doc fix once it's settled that the docs are what's
+wrong. If it isn't (the code could be wrong, or it's unclear which one is), leave
+the block to resolve and report it. If only the form differs, change the code or
+the marker instead.
+
+## Resolved, ignored, awaiting a doc fix, to resolve
 
 A doc block is **resolved** when some marked code, with its options applied, is
 byte-for-byte the block (with the marker's `doc` options applied) apart from
 its placeholders. A block whose content is in a file under `.asadoc/ignore/` is
-**ignored**. Every other block is still **to resolve**.
+**ignored**. A block whose content is in a file under
+`.asadoc/awaiting-doc-fix/` is **awaiting a doc fix**. Every other block is
+still **to resolve**.
 
 ## Commands
 

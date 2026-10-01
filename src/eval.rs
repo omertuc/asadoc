@@ -3,9 +3,12 @@
 //!
 //! A block is resolved when some marked code (its options applied, its doc
 //! options applied to the block, its placeholders free) matches it; ignored
-//! when its content is in an ignore directory; and otherwise still to resolve,
-//! with the repo code most like it as candidates.
+//! when its content is in an ignore directory; awaiting a doc fix when its
+//! content is in the awaiting-doc-fix directory; and otherwise still to
+//! resolve. Blocks awaiting a doc fix and blocks still to resolve get the repo
+//! code most like them as candidates.
 
+use crate::awaiting::{AwaitingDocFixes, AwaitingEntry, DocFix};
 use crate::config::{AsadocConfig, Docs};
 use crate::docs::{self, Assembly, DocBlock};
 use crate::ignored::{IgnoreReason, IgnoredBlocks};
@@ -65,6 +68,8 @@ pub(crate) struct BlockEval {
     pub block: DocBlock,
     pub matches: Vec<CodeMatch>,
     pub ignored_as: Option<String>,
+    /// The doc fix the block awaits, when it's out of date
+    pub awaiting_doc_fix: Option<String>,
     pub candidates: Vec<CandidateInfo>,
     /// For an unresolved block: a stale ignored entry it probably used to be
     pub former_ignored_entries: Vec<FormerIgnoredEntry>,
@@ -74,8 +79,13 @@ impl BlockEval {
     pub(crate) const fn resolved(&self) -> bool {
         !self.matches.is_empty()
     }
+    /// Whether the block needs nothing more from this repo for now
     pub(crate) const fn done(&self) -> bool {
-        self.resolved() || self.ignored_as.is_some()
+        self.resolved() || self.ignored_as.is_some() || self.awaiting_doc_fix.is_some()
+    }
+    /// Whether some repo code should match the block, now or once the docs are fixed
+    pub(crate) const fn unmatched(&self) -> bool {
+        !self.resolved() && self.ignored_as.is_none()
     }
 }
 
@@ -91,6 +101,11 @@ pub(crate) struct Evaluation {
     pub stale_ignored: Vec<(String, String)>,
     /// The reasons blocks can be ignored for
     pub ignore_reasons: Vec<IgnoreReason>,
+    /// Awaiting-doc-fix entries no unmatched doc block has anymore: the docs
+    /// changed, or the code matches them again
+    pub stale_awaiting: Vec<AwaitingEntry>,
+    /// The doc fixes blocks can await
+    pub doc_fixes: Vec<DocFix>,
     /// Marked code no doc block matches (indexes into `scan.marked`)
     pub unused_marked_indexes: Vec<usize>,
 }
@@ -282,6 +297,8 @@ pub(crate) fn evaluate(config: &AsadocConfig, with_candidates: bool) -> Result<E
     let scan = repo::scan(config).context("scanning the repo for marked code")?;
     progress::step("loading the ignore directories");
     let ignored_blocks = IgnoredBlocks::load_all(config).context("loading the ignore directories")?;
+    let awaiting = AwaitingDocFixes::load(&config.awaiting_doc_fix_dir)
+        .with_context(|| format!("loading {}", config.awaiting_doc_fix_dir.display()))?;
 
     progress::step("reading the docs");
     let mut assemblies = read_assemblies(config)?
@@ -289,12 +306,13 @@ pub(crate) fn evaluate(config: &AsadocConfig, with_candidates: bool) -> Result<E
         .map(|assembly| {
             let assembly_id = assembly.id.clone();
             progress::step(format!("comparing the code blocks of {assembly_id} with the code"));
-            evaluate_assembly(config, assembly, &scan, &ignored_blocks)
+            evaluate_assembly(config, assembly, &scan, &ignored_blocks, &awaiting)
                 .with_context(|| format!("evaluating the assembly {assembly_id}"))
         })
         .collect::<Result<Vec<_>>>()?;
 
     let stale_ignored = stale_ignored(&assemblies, &ignored_blocks);
+    let stale_awaiting = stale_awaiting(&assemblies, &awaiting);
     let unused_marked_indexes = unused_code(&assemblies, &scan);
 
     if with_candidates {
@@ -308,6 +326,8 @@ pub(crate) fn evaluate(config: &AsadocConfig, with_candidates: bool) -> Result<E
         scan,
         stale_ignored,
         ignore_reasons: ignored_blocks.reasons,
+        stale_awaiting,
+        doc_fixes: awaiting.fixes,
         unused_marked_indexes,
     })
 }
@@ -354,6 +374,7 @@ fn evaluate_assembly(
     assembly: Assembly,
     scan: &RepoScan,
     ignored_blocks: &IgnoredBlocks,
+    awaiting: &AwaitingDocFixes,
 ) -> Result<AssemblyEval> {
     let docs = config
         .docs
@@ -362,7 +383,7 @@ fn evaluate_assembly(
     let block_evals = assembly
         .modules
         .iter()
-        .map(|module| evaluate_module(docs, module, scan, ignored_blocks))
+        .map(|module| evaluate_module(docs, module, scan, ignored_blocks, awaiting))
         .collect::<Result<Vec<_>>>()?
         .into_iter()
         .flatten()
@@ -378,25 +399,38 @@ fn evaluate_module(
     module: &str,
     scan: &RepoScan,
     ignored_blocks: &IgnoredBlocks,
+    awaiting: &AwaitingDocFixes,
 ) -> Result<Vec<BlockEval>> {
     docs::extract_blocks(docs, module)
         .with_context(|| format!("reading the module {module}"))?
         .into_iter()
-        .map(|block| evaluate_block(block, scan, ignored_blocks))
+        .map(|block| evaluate_block(block, scan, ignored_blocks, awaiting))
         .collect()
 }
 
-fn evaluate_block(block: DocBlock, scan: &RepoScan, ignored_blocks: &IgnoredBlocks) -> Result<BlockEval> {
+fn evaluate_block(
+    block: DocBlock,
+    scan: &RepoScan,
+    ignored_blocks: &IgnoredBlocks,
+    awaiting: &AwaitingDocFixes,
+) -> Result<BlockEval> {
     let matches = match_block(&block, &scan.marked)?;
-    let ignored_as = if matches.is_empty() {
-        ignored_blocks.reason_of(&block.content).map(str::to_owned)
+    let (ignored_as, awaiting_doc_fix) = if matches.is_empty() {
+        let ignored_as = ignored_blocks.reason_of(&block.content).map(str::to_owned);
+        let awaiting_doc_fix = if ignored_as.is_none() {
+            awaiting.fix_of(&block.content).map(str::to_owned)
+        } else {
+            None
+        };
+        (ignored_as, awaiting_doc_fix)
     } else {
-        None
+        (None, None)
     };
     Ok(BlockEval {
         block,
         matches,
         ignored_as,
+        awaiting_doc_fix,
         candidates: vec![],
         former_ignored_entries: vec![],
     })
@@ -442,6 +476,22 @@ fn stale_ignored(assemblies: &[AssemblyEval], ignored_blocks: &IgnoredBlocks) ->
         .collect()
 }
 
+/// Awaiting-doc-fix entries no doc block awaiting a fix has
+fn stale_awaiting(assemblies: &[AssemblyEval], awaiting: &AwaitingDocFixes) -> Vec<AwaitingEntry> {
+    let awaiting_contents_in_use: HashSet<&str> = assemblies
+        .iter()
+        .flat_map(|assembly_eval| &assembly_eval.blocks)
+        .filter(|block_eval| block_eval.awaiting_doc_fix.is_some())
+        .map(|block_eval| block_eval.block.content.as_str())
+        .collect();
+    awaiting
+        .entries
+        .iter()
+        .filter(|entry| !awaiting_contents_in_use.contains(entry.content.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// Marked code in this repo no doc block matches (indexes into
 /// `scan.marked`). Other code sources may mark code for docs this config
 /// doesn't check
@@ -460,8 +510,9 @@ fn unused_code(assemblies: &[AssemblyEval], scan: &RepoScan) -> Vec<usize> {
         .collect()
 }
 
-/// For each block still to resolve: the code most like it, and the stale
-/// ignored content it probably used to be
+/// For each block awaiting a doc fix or still to resolve: the code most like
+/// it; and for each block still to resolve, the stale ignored content it
+/// probably used to be
 fn add_candidates(
     config: &AsadocConfig,
     assemblies: &mut [AssemblyEval],
@@ -472,7 +523,7 @@ fn add_candidates(
     assemblies
         .iter_mut()
         .flat_map(|assembly_eval| &mut assembly_eval.blocks)
-        .filter(|block_eval| !block_eval.done())
+        .filter(|block_eval| block_eval.unmatched())
         .try_for_each(|block_eval| {
             progress::step(format!(
                 "comparing {} with the marked code, to suggest matches",
@@ -480,10 +531,12 @@ fn add_candidates(
             ));
             block_eval.candidates = candidates_for(&block_eval.block, &pool_entries)
                 .with_context(|| format!("finding code resembling {}", block_eval.block.reference))?;
-            block_eval.former_ignored_entries = former_ignored_entry(&block_eval.block, stale_ignored)
-                .with_context(|| format!("comparing {} with ignored content", block_eval.block.reference))?
-                .into_iter()
-                .collect();
+            if !block_eval.done() {
+                block_eval.former_ignored_entries = former_ignored_entry(&block_eval.block, stale_ignored)
+                    .with_context(|| format!("comparing {} with ignored content", block_eval.block.reference))?
+                    .into_iter()
+                    .collect();
+            }
             Ok(())
         })
 }

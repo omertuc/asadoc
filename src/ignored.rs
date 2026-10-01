@@ -42,7 +42,7 @@ const PRESET_REASONS: &[(&str, &str)] = &[
 ];
 
 /// The file in a reason's directory that describes the reason
-const DESCRIPTION_FILE_NAME: &str = "README.md";
+pub(crate) const DESCRIPTION_FILE_NAME: &str = "README.md";
 
 /// A reason to ignore blocks: a subdirectory of the ignore directory
 #[derive(Clone, Debug, Serialize)]
@@ -260,7 +260,7 @@ impl IgnoredBlocks {
 }
 
 /// Lowercase letters, digits and dashes, starting with a letter or digit
-fn is_valid_reason_name(name: &str) -> bool {
+pub(crate) fn is_valid_reason_name(name: &str) -> bool {
     name.chars()
         .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit() || character == '-')
         && !name.is_empty()
@@ -290,7 +290,7 @@ fn load_reasons(ignore_dir: &Path) -> Result<Vec<IgnoreReason>> {
 }
 
 /// The subdirectories of `ignore_dir`, in name order, with their descriptions
-fn load_reason_dirs(ignore_dir: &Path) -> Result<Vec<IgnoreReason>> {
+pub(crate) fn load_reason_dirs(ignore_dir: &Path) -> Result<Vec<IgnoreReason>> {
     let ignore_dir_listing = match fs::read_dir(ignore_dir) {
         Ok(ignore_dir_listing) => ignore_dir_listing,
         // Nothing ignored yet
@@ -325,7 +325,7 @@ fn load_reason_dirs(ignore_dir: &Path) -> Result<Vec<IgnoreReason>> {
 }
 
 /// The entries ignored for `reason`, in file name order
-fn load_reason(ignore_dir: &Path, reason: &str) -> Result<Vec<IgnoredEntry>> {
+pub(crate) fn load_reason(ignore_dir: &Path, reason: &str) -> Result<Vec<IgnoredEntry>> {
     let reason_dir = ignore_dir.join(reason);
     let reason_dir_listing = match fs::read_dir(&reason_dir) {
         Ok(reason_dir_listing) => reason_dir_listing,
@@ -363,7 +363,7 @@ fn load_reason(ignore_dir: &Path, reason: &str) -> Result<Vec<IgnoredEntry>> {
 }
 
 /// `{file_stem}.txt` in `reason_dir`, or `{file_stem}-2.txt`, `{file_stem}-3.txt`… when that's taken
-fn unused_path(reason_dir: &Path, file_stem: &str) -> Result<PathBuf> {
+pub(crate) fn unused_path(reason_dir: &Path, file_stem: &str) -> Result<PathBuf> {
     iter::once(reason_dir.join(format!("{file_stem}.txt")))
         .chain((2..=u64::MAX).map(|suffix| reason_dir.join(format!("{file_stem}-{suffix}.txt"))))
         .find(|candidate_path| !candidate_path.exists())

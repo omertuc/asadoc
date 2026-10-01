@@ -2,6 +2,7 @@
 //! only presents; everything it shows is computed here, and every change it
 //! asks for is made here.
 
+use crate::awaiting::{AwaitingDocFixes, DocFix};
 use crate::config::{AsadocConfig, Docs};
 use crate::docs;
 use crate::eval::{self, AssemblyEval, BlockEval, CandidateInfo, Evaluation, FormerIgnoredEntry};
@@ -280,6 +281,8 @@ fn router(state: SharedState) -> Router {
         .route("/api/ignore", post(ignore_block))
         .route("/api/unignore", post(unignore_block))
         .route("/api/remove-ignored", post(remove_ignored_content))
+        .route("/api/unawait", post(unawait_block))
+        .route("/api/remove-awaiting", post(remove_awaiting_content))
         .with_state(state)
 }
 
@@ -435,6 +438,8 @@ struct BlockData {
     matched_code: Option<Vec<CodeRef>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     ignored_as: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    awaiting_doc_fix: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -449,6 +454,7 @@ struct GuideData {
     blocks: Vec<BlockData>,
     resolved: Vec<BlockData>,
     ignored: Vec<BlockData>,
+    awaiting: Vec<BlockData>,
 }
 
 #[derive(Serialize)]
@@ -480,6 +486,12 @@ struct StaleIgnored {
 }
 
 #[derive(Serialize)]
+struct StaleAwaiting {
+    fix: String,
+    content: String,
+}
+
+#[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct ReportData {
     guides: Vec<GuideData>,
@@ -487,6 +499,8 @@ struct ReportData {
     total_blocks: usize,
     stale_ignored: Vec<StaleIgnored>,
     ignore_reasons: Vec<IgnoreReason>,
+    stale_awaiting: Vec<StaleAwaiting>,
+    doc_fixes: Vec<DocFix>,
     #[serde(rename = "code")]
     marked_code: Vec<CodeData>,
     problems: Vec<MarkerProblem>,
@@ -571,13 +585,22 @@ fn build_report(config: &AsadocConfig, evaluation: &Evaluation) -> Result<Report
             })
             .collect(),
         ignore_reasons: evaluation.ignore_reasons.clone(),
+        stale_awaiting: evaluation
+            .stale_awaiting
+            .iter()
+            .map(|entry| StaleAwaiting {
+                fix: entry.fix.clone(),
+                content: entry.content.clone(),
+            })
+            .collect(),
+        doc_fixes: evaluation.doc_fixes.clone(),
         marked_code: code_data(config, evaluation),
         problems: evaluation.scan.problems.clone(),
         todos: evaluation.scan.todos.clone(),
     })
 }
 
-/// An assembly's blocks: to resolve, resolved, and ignored
+/// An assembly's blocks: to resolve, resolved, ignored, and awaiting a doc fix
 fn guide_data(
     config: &AsadocConfig,
     evaluation: &Evaluation,
@@ -631,6 +654,16 @@ fn guide_data(
                 ..block_data(docs, assembly, block)
             })
             .collect(),
+        awaiting: assembly
+            .blocks
+            .iter()
+            .filter(|block| block.awaiting_doc_fix.is_some())
+            .map(|block| BlockData {
+                candidates: Some(block.candidates.clone()),
+                awaiting_doc_fix: block.awaiting_doc_fix.clone(),
+                ..block_data(docs, assembly, block)
+            })
+            .collect(),
     })
 }
 
@@ -654,6 +687,7 @@ fn block_data(docs: &Docs, assembly: &AssemblyEval, block: &BlockEval) -> BlockD
         former_ignored_entries: None,
         matched_code: None,
         ignored_as: None,
+        awaiting_doc_fix: None,
     }
 }
 
@@ -948,6 +982,38 @@ async fn remove_ignored_content(
         ignored_blocks.unignore(&request.content)
     })
     .context("removing ignored content")?;
+    state.mark_changed();
+    Ok(success_response())
+}
+
+/// Loads the awaiting-doc-fix directory and makes a change to it
+fn update_awaiting(config: &AsadocConfig, change: impl FnOnce(&mut AwaitingDocFixes) -> Result<()>) -> Result<()> {
+    let mut awaiting = AwaitingDocFixes::load(&config.awaiting_doc_fix_dir)
+        .with_context(|| format!("loading {}", config.awaiting_doc_fix_dir.display()))?;
+    change(&mut awaiting)
+}
+
+async fn unawait_block(State(state): State<SharedState>, Json(action): Json<BlockAction>) -> ApiResult {
+    with_evaluation(&state, move |config, evaluation| {
+        let block = evaluation
+            .find(&action.assembly_id, &action.reference)
+            .filter(|block| block.awaiting_doc_fix.is_some())
+            .with_context(|| format!("{} isn't awaiting a doc fix", action.reference))
+            .status(StatusCode::NOT_FOUND)?;
+        update_awaiting(config, |awaiting| awaiting.stop_awaiting(&block.block.content))
+            .with_context(|| format!("stopping {} awaiting a doc fix", action.reference))?;
+        println!("Stopped {} awaiting a doc fix", action.reference);
+        Ok(success_response())
+    })
+    .await
+}
+
+async fn remove_awaiting_content(
+    State(state): State<SharedState>,
+    Json(request): Json<RemoveIgnoredRequest>,
+) -> ApiResult {
+    update_awaiting(state.config()?, |awaiting| awaiting.stop_awaiting(&request.content))
+        .context("removing content awaiting a doc fix")?;
     state.mark_changed();
     Ok(success_response())
 }

@@ -1,5 +1,6 @@
 //! `.asadoc/config.toml`: where the docs are, which of them to check, and where
-//! the directory of ignored doc blocks is. Paths are relative to the config
+//! the directories of ignored doc blocks and of doc blocks awaiting a doc fix
+//! are. Paths are relative to the config
 //! file's directory (`.asadoc/`).
 //!
 //! ```toml
@@ -41,6 +42,9 @@ struct RawAsadocConfig {
     /// Directory of doc blocks that don't come from this repo
     #[serde(default = "default_ignore_dir")]
     ignore_dir: PathBuf,
+    /// Directory of doc blocks that are out of date, awaiting a fix to the docs
+    #[serde(default = "default_awaiting_doc_fix_dir")]
+    awaiting_doc_fix_dir: PathBuf,
     /// This repo's; see `RawDocs::external_link_format`
     #[serde(rename = "external-link-format")]
     external_link_format: Option<String>,
@@ -100,6 +104,10 @@ struct RawAsciidoc {
 
 fn default_ignore_dir() -> PathBuf {
     PathBuf::from("ignore")
+}
+
+fn default_awaiting_doc_fix_dir() -> PathBuf {
+    PathBuf::from("awaiting-doc-fix")
 }
 
 /// One docs source
@@ -164,6 +172,8 @@ pub(crate) struct AsadocConfig {
     pub code: Vec<CodeSource>,
     /// This repo's ignore directory
     pub ignore_dir: PathBuf,
+    /// This repo's directory of doc blocks awaiting a doc fix
+    pub awaiting_doc_fix_dir: PathBuf,
 }
 
 impl AsadocConfig {
@@ -229,6 +239,7 @@ impl AsadocConfig {
             docs,
             code: iter::once(this_repo).chain(other_code).collect(),
             ignore_dir,
+            awaiting_doc_fix_dir: config_dir.join(raw_config.awaiting_doc_fix_dir),
         })
     }
 

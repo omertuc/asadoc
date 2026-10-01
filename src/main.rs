@@ -1,6 +1,7 @@
 #[macro_use]
 mod re;
 
+mod awaiting;
 mod check;
 mod config;
 mod docs;
@@ -60,6 +61,22 @@ enum AsadocCommand {
     /// Make the change `asadoc check` lists under a doc block (marking lines
     /// of a file that has markers, and similar simple changes)
     Fix { block: String },
+    /// Have doc blocks that are out of date (the code changed, the docs are
+    /// still to follow) await a fix to the docs: `asadoc check` passes with
+    /// them, and lists them, until their content changes. The fix is a
+    /// directory in `.asadoc/awaiting-doc-fix/`, its README.md saying what the
+    /// docs need to change
+    AwaitDocFix {
+        #[arg(required = true)]
+        blocks: Vec<String>,
+        /// The doc fix's name: lowercase letters, digits and dashes
+        #[arg(long)]
+        fix: String,
+        /// For a new doc fix: what the docs need to change, and where that
+        /// change is tracked (an issue or PR)
+        #[arg(long)]
+        description: Option<String>,
+    },
     /// List the `TODO`s on this repo's markers, as `file:line: text`
     Todo,
     /// Serve the review UI
@@ -67,7 +84,7 @@ enum AsadocCommand {
         #[arg(long, default_value_t = 3000)]
         port: u16,
     },
-    /// How Asadoc works: markers, their options, ignoring, checking
+    /// How Asadoc works: markers, their options, ignoring, awaiting doc fixes, checking
     Guide,
 }
 
@@ -115,6 +132,12 @@ fn run() -> Result<bool> {
                 CheckFormat::Github => github::report(&config, &evaluation).context("checking every doc block"),
             }
         }
+        AsadocCommand::AwaitDocFix {
+            blocks,
+            fix,
+            description,
+        } => check::await_doc_fix(&load_config()?, blocks, fix, description.as_deref())
+            .with_context(|| format!("making the blocks await the doc fix {fix}")),
         AsadocCommand::Todo => check::list_todos(&load_config()?).context("listing the TODOs"),
         AsadocCommand::Fix { block } => check::fix(&load_config()?, block).with_context(|| format!("fixing {block}")),
         AsadocCommand::Serve { port } => {

@@ -45,6 +45,12 @@ Every code block must be associated with code. No exception. If you can't or
 don't want to associate it with code, you must declare it explicitly as
 "ignored" in a special file.
 
+When the code changes on purpose and leaves a code block out of date, the docs
+need a fix, which can take a while. Until it lands, the block can be declared
+"awaiting a doc fix", with a note on what the docs need to change, so the code
+change isn't blocked. The block is still reported, and is checked against the
+code again as soon as the docs change.
+
 ## Markers
 
 Association is done *inline*. We don't keep a map between docs and code. We
@@ -68,5 +74,5 @@ for you to help it match the docs.
 ## CLI
 
 Asadoc offers a CLI for use by scripts, CI and agents. The main use case would
-be to ensure that all doc code blocks are accounted for through associations or
-through ignoring.
+be to ensure that all doc code blocks are accounted for through associations,
+through ignoring, or as awaiting a doc fix.
