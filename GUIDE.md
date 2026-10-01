@@ -79,9 +79,10 @@ Options are:
 - `remove-lines-starting-with: "<text>"` drops lines whose text (after
   indentation) starts with `<text>`, e.g. `"#"` for comments on one side only.
 - `remove-text: "<regex>"` removes every match of `<regex>`, which may span
-  lines (`\n`). It's for text only one side has, wherever it sits. When it
-  matches nothing, the doc block doesn't match (on the doc side) or it's a
-  marker problem (on the code side).
+  lines (`\n`). It's for text only one side has, wherever it sits, when no
+  more specific option fits. Keep the regex as narrow as the text it targets.
+  When it matches nothing, the doc block doesn't match (on the doc side) or
+  it's a marker problem (on the code side).
 - `remove-blank-lines` drops lines that are empty or only whitespace.
 - `unindent-common` removes the indentation all non-blank lines share.
 - `reindent: <from> -> <to>` turns each `<from>` spaces of leading indentation
@@ -114,23 +115,27 @@ itself.
 
 ### Writing good markers
 
-You have multiple tools at your disposal:
+The point is to find drift, not to make `asadoc check` pass. If the doc or the
+code is actually wrong, or matching them would mean changing what the code does,
+leave the block unresolved and report it.
 
-- Modifying or moving the code
-- Using marker options to modify the code
-- Using marker options to modify the docs 
-
-Use common sense when deciding which of the above approaches to use. Too many
-marker options becomes disruptive and hard to maintain. Modifying the docs is
-hard to reason about as they're not present to the reader and apply to ALL docs
-that try to match this code. Twisting the code into its doc counterpart often
-doesn't make sense - e.g. if the doc uses some weird formatting, and the code
-gets auto-formatted and linted, or if the doc has some comment meant for doc
-readers and not code readers, etc etc
-
-Don't be shy adding TODOs when you needed markers that could've otherwise been
-avoided. TODO to either modify the code, modify the docs or maybe add new
-asadoc (not overly specific) features that would help do this better
+1. Change the code where that doesn't make it worse. Arbitrary formatting
+   (indentation, key order) can just match the doc. Code embedded in other code,
+   like a template inside a script, can often move to its own file and be
+   marked whole. Don't twist code into the doc's shape when that would make it
+   worse or odd next to the code around it, e.g. the code is auto-formatted, or
+   the doc has comments meant for doc readers, not code readers. Use an option
+   instead.
+2. Cover what's left with as few options as possible, each as narrow as
+   possible. Prefer code-side options: doc-side ones are hard to reason about,
+   since the docs aren't in front of whoever reads the marker, and they apply
+   to every doc block matched against this code.
+3. Run `asadoc check` until the block matches.
+4. Go through every option on the marker, and any text a param covers beyond
+   the placeholder itself, and ask whether a change to the code or the docs
+   would make it unnecessary. If one would, add a TODO naming that change. If
+   only a new asadoc feature would, add a TODO proposing it in general terms.
+   The marker isn't done until every option has been through this.
 
 ## Ignored blocks
 

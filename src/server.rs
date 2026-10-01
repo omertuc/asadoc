@@ -38,6 +38,7 @@ use tokio_stream::wrappers::BroadcastStream;
 const INDEX_HTML: &str = include_str!("../ui/index.html");
 const APP_JS: &str = include_str!("../ui/app.mjs");
 const APP_CSS: &str = include_str!("../ui/app.css");
+const GUIDE_HTML: &str = include_str!("../ui/guide.html");
 const GUIDE_MARKDOWN: &str = include_str!("../GUIDE.md");
 
 struct AppState {
@@ -263,7 +264,11 @@ fn router(state: SharedState) -> Router {
         )
         .route(
             "/guide",
-            get(|| async { ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], GUIDE_MARKDOWN) }),
+            get(|| async { ([(header::CONTENT_TYPE, "text/html; charset=utf-8")], GUIDE_HTML) }),
+        )
+        .route(
+            "/guide.md",
+            get(|| async { ([(header::CONTENT_TYPE, "text/markdown; charset=utf-8")], GUIDE_MARKDOWN) }),
         )
         .route("/api/status", get(serve_status))
         .route("/api/data", get(serve_data))

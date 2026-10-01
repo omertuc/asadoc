@@ -689,20 +689,20 @@ function candidateBody(b, o) {
     body.appendChild(el('div', 'fix-note', `💡 This makes it identical to the doc block by changing the repo:<ul>${steps.map(x => `<li>${x}</li>`).join('')}</ul>`));
   } else {
     const note = el('div', 'miss-note');
-    note.innerHTML = 'Not identical. Edit it until it reads exactly like the doc (for values the repo leaves open, like <code>&lt;NODES_MTU&gt;</code>, add <code>| param: "&lt;NODES_MTU&gt;"</code> to its marker: <a href="/guide" target="_blank">see how</a>), or ';
+    note.innerHTML = 'Not identical. Edit it or its mark options (<a href="/guide" target="_blank">see how</a>), or ';
     const copy = el('button', 'link inline', 'copy a prompt for your AI assistant');
     copy.addEventListener('click', () => copyPromptFromMention(b));
     note.appendChild(copy);
     note.appendChild(document.createTextNode('.'));
     body.appendChild(note);
   }
+  const view = el('div', 'file-view');
+  body.appendChild(view);
+  renderFile(view, o.file, o.fileText, o.kind === 'section' || o.kind === 'lines' ? o.lines : null, o.markerLines);
   const diff = el('div', 'diff');
   body.appendChild(diff);
   renderDiff(diff, o.docOptions.length ? 'doc (doc options applied)' : 'doc', o.doc,
     o.kind === 'lines' ? `${o.file}, lines ${o.lines[0]}-${o.lines[1]}` : (o.name ? `${o.file}, section ${o.name}` : o.file) + (o.options.length ? ' (marker options applied)' : ''), o.content);
-  const view = el('div', 'file-view');
-  body.appendChild(view);
-  renderFile(view, o.file, o.fileText, o.kind === 'section' || o.kind === 'lines' ? o.lines : null, o.markerLines);
   return body;
 }
 
@@ -901,6 +901,8 @@ function renderBlock() {
     copy.addEventListener('click', () => copyPromptFromMention(b));
     none.append(copy, ').');
     assoc.appendChild(none);
+  } else {
+    assoc.appendChild(el('p', 'muted', 'The following already marked code seems similar to this block:'));
   }
   b.candidates.forEach((o, i) => {
     const open = i === selectedCandidate;

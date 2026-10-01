@@ -285,3 +285,20 @@ h2 { font-size: 0.95rem; margin: 28px 0 10px; }
   animation: spin 0.8s linear infinite;
 }
 @keyframes spin { to { transform: rotate(360deg); } }
+
+/* --- Guide page --- */
+.guide-page { max-width: 820px; margin: 0 auto; padding: 32px 16px 64px; font-size: 15px; line-height: 1.6; }
+.guide-page h1, .guide-page h2, .guide-page h3 { margin: 1.6em 0 0.6em; line-height: 1.25; }
+.guide-page h1 { font-size: 1.9rem; margin-top: 0; }
+.guide-page h2 { font-size: 1.4rem; padding-bottom: 0.3em; border-bottom: 1px solid var(--border); }
+.guide-page h3 { font-size: 1.15rem; }
+.guide-page p, .guide-page ul, .guide-page ol, .guide-page pre, .guide-page table, .guide-page blockquote { margin-bottom: 1em; }
+.guide-page ul, .guide-page ol { padding-left: 2em; }
+.guide-page li + li { margin-top: 0.25em; }
+.guide-page code { padding: 0.15em 0.35em; border-radius: 4px; background: var(--raised); }
+.guide-page pre { padding: 12px 16px; border-radius: 6px; background: var(--panel); border: 1px solid var(--border); overflow-x: auto; }
+.guide-page pre code { padding: 0; background: none; font-size: 1em; }
+.guide-page blockquote { padding: 0 1em; color: var(--muted); border-left: 3px solid var(--border); }
+.guide-page table { border-collapse: collapse; }
+.guide-page th, .guide-page td { padding: 6px 12px; border: 1px solid var(--border); }
+.guide-page th { background: var(--panel); }
