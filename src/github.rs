@@ -62,7 +62,7 @@ fn markdown(config: &AsadocConfig, evaluation: &Evaluation, summary: &CheckSumma
     }
     writeln!(
         out,
-        "Code in this repo marked with `@docs-as-code:` comments has to match the code blocks in the docs, \
+        "Code in this repo marked with `@code-as-a-doc:` comments has to match the code blocks in the docs, \
          so that the docs and the code don't drift apart. Every code block in the docs has to match marked code \
          or be ignored.\n"
     )?;

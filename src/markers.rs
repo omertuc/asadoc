@@ -1,9 +1,9 @@
 //! Markers in repo files, in `#` comments:
 //!
 //! ```text
-//! # @docs-as-code: file [| <option>]...
-//! # @docs-as-code: start section "<name>" [| <option>]...
-//! # @docs-as-code: end section "<name>"
+//! # @code-as-a-doc: file [| <option>]...
+//! # @code-as-a-doc: start section "<name>" [| <option>]...
+//! # @code-as-a-doc: end section "<name>"
 //! ```
 //!
 //! Options may also continue on the comment lines right after a file or start
@@ -42,7 +42,7 @@ use serde::Serialize;
 use std::collections::BTreeMap;
 use std::iter::once;
 
-pub(crate) const MARKER_PREFIX: &str = "@docs-as-code:";
+pub(crate) const MARKER_PREFIX: &str = "@code-as-a-doc:";
 
 pub(crate) fn section_start_marker(name: &str) -> String {
     format!("{MARKER_PREFIX} start section \"{name}\"")
@@ -887,7 +887,7 @@ mod tests {
 
     #[test]
     fn parses_multiline_markers_and_options() -> Result<()> {
-        let text = "x\n    # @docs-as-code: start section \"s\"\n    #   | doc strip-line-prefix: \"$ \"\n    #   | remove-prefix: \"if \" | unindent-common\n    #   | reindent: 4 -> 2 | param: \"<A>\"\n    if a \\\n        b <A>\n    # @docs-as-code: end section \"s\"\n";
+        let text = "x\n    # @code-as-a-doc: start section \"s\"\n    #   | doc strip-line-prefix: \"$ \"\n    #   | remove-prefix: \"if \" | unindent-common\n    #   | reindent: 4 -> 2 | param: \"<A>\"\n    if a \\\n        b <A>\n    # @code-as-a-doc: end section \"s\"\n";
         let markers = parse_markers(text)?;
         assert!(markers.problems.is_empty(), "{:?}", markers.problems);
         let section = &markers.sections["s"];
@@ -946,7 +946,7 @@ mod tests {
 
     #[test]
     fn notes_change_nothing_and_todos_are_listed() -> Result<()> {
-        let text = "# @docs-as-code: start section \"s\" | comment: \"why | this\"\n#   | TODO: \"use a file\"\n#   | unindent-common | TODO: \"simplify the docs\"\n  a\n# @docs-as-code: end section \"s\"\n";
+        let text = "# @code-as-a-doc: start section \"s\" | comment: \"why | this\"\n#   | TODO: \"use a file\"\n#   | unindent-common | TODO: \"simplify the docs\"\n  a\n# @code-as-a-doc: end section \"s\"\n";
         let markers = parse_markers(text)?;
         assert!(markers.problems.is_empty(), "{:?}", markers.problems);
         let options = &markers.sections["s"].header.options;
@@ -968,11 +968,11 @@ mod tests {
     #[test]
     fn removes_a_section_s_markers() -> Result<()> {
         let text =
-            "a\n# @docs-as-code: start section \"s\"\n#   | TODO: \"x\"\nb\n# @docs-as-code: end section \"s\"\nc";
+            "a\n# @code-as-a-doc: start section \"s\"\n#   | TODO: \"x\"\nb\n# @code-as-a-doc: end section \"s\"\nc";
         assert_eq!(remove_markers(text, Some("s"))?, "a\nb\nc");
         assert!(remove_markers(text, Some("t")).is_err());
         assert!(remove_markers(text, None).is_err());
-        assert_eq!(remove_markers("# @docs-as-code: file\nx\n", None)?, "x\n");
+        assert_eq!(remove_markers("# @code-as-a-doc: file\nx\n", None)?, "x\n");
         Ok(())
     }
 
@@ -989,7 +989,7 @@ mod tests {
     #[test]
     fn reports_problems() -> Result<()> {
         let markers = parse_markers(
-            "# @docs-as-code: start section \"a\" | frob\n# @docs-as-code: end section \"b\"\n# @docs-as-code: start section \"c\" | param: \"x\" -> \"y\"\n",
+            "# @code-as-a-doc: start section \"a\" | frob\n# @code-as-a-doc: end section \"b\"\n# @code-as-a-doc: start section \"c\" | param: \"x\" -> \"y\"\n",
         )?;
         assert_eq!(markers.problems.len(), 3, "{:?}", markers.problems);
         Ok(())

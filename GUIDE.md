@@ -33,19 +33,19 @@ marked in `#` comments (more comment styles might be supported later):
   ```bash
   ...
 
-  # @docs-as-code: start section "ip-forwarding-patch"
+  # @code-as-a-doc: start section "ip-forwarding-patch"
   oc patch network.operator.openshift.io cluster --type=merge -p \
     '{"spec":{"defaultNetwork":{"ovnKubernetesConfig":{"gatewayConfig":{"ipForwarding":"Global"}}}}}'
-  # @docs-as-code: end section "ip-forwarding-patch"
+  # @code-as-a-doc: end section "ip-forwarding-patch"
 
   ...
   ```
 
-- Whole file: a line with `# @docs-as-code: file` marks the entire file. A
+- Whole file: a line with `# @code-as-a-doc: file` marks the entire file. A
   whole file for now cannot contain sections within it.
 
   ```yaml
-  # @docs-as-code: file
+  # @code-as-a-doc: file
   apiVersion: provisioning.dpu.nvidia.com/v1alpha1
   kind: BFB
 
@@ -58,7 +58,7 @@ modify the code. Use the "doc" keyword before an option to make the option
 apply to the docs instead. For example:
 
 ```bash
-    # @docs-as-code: start section "dpu-worker-config-install"
+    # @code-as-a-doc: start section "dpu-worker-config-install"
     #   | doc strip-line-prefix: "$ "
     #   | remove-prefix: "if " | remove-suffix: "; then"
     #   | unindent-common
@@ -66,7 +66,7 @@ apply to the docs instead. For example:
     if helm upgrade --install dpu-worker-config \
         ...
         ${version_flag}; then
-    # @docs-as-code: end section "dpu-worker-config-install"
+    # @code-as-a-doc: end section "dpu-worker-config-install"
 ```
 
 Options are:

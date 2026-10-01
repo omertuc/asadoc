@@ -246,10 +246,10 @@ function markerLineHtml(text, tips) {
   const tip = (title, side, body) => tips.push({ title, side, body }) - 1;
   const out = [];
   let rest;
-  const head = text.match(/^(.*?)(@docs-as-code:)(\s*)(.*)$/);
+  const head = text.match(/^(.*?)(@code-as-a-doc:)(\s*)(.*)$/);
   if (head) {
     out.push(`<span class="dac-comment">${esc(head[1])}</span>`);
-    out.push(`<span class="dac-at" data-tip="${tip('@docs-as-code:', null, 'Marks repo code that appears in the docs. Every doc code block is compared with what it marks, after its options are applied.')}">${esc(head[2])}</span>`, esc(head[3]));
+    out.push(`<span class="dac-at" data-tip="${tip('@code-as-a-doc:', null, 'Marks repo code that appears in the docs. Every doc code block is compared with what it marks, after its options are applied.')}">${esc(head[2])}</span>`, esc(head[3]));
     rest = head[4];
     const kind = rest.match(/^(file|start section|end section)(\s*)("(?:[^"\\]|\\.)*")?/);
     if (kind) {
