@@ -5,6 +5,7 @@ mod check;
 mod config;
 mod docs;
 mod eval;
+mod github;
 mod ignored;
 mod lightbulb;
 mod links;
@@ -16,8 +17,8 @@ mod report;
 mod server;
 mod source;
 
-use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use anyhow::{Context, Result, bail};
+use clap::{Parser, Subcommand, ValueEnum};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
@@ -50,6 +51,11 @@ enum AsadocCommand {
         /// Compare the given doc blocks with this marked code instead of their closest
         #[arg(long, value_name = "CODE")]
         against: Option<String>,
+        /// How to report checking everything: `markdown` prints a report for
+        /// a GitHub job summary or PR comment; `github`, in GitHub Actions,
+        /// also annotates the code and adds the report to the job summary
+        #[arg(long, value_enum, default_value_t = CheckFormat::Text)]
+        format: CheckFormat,
     },
     /// Make the change `asadoc check` lists under a doc block (marking lines
     /// of a file that has markers, and similar simple changes)
@@ -63,6 +69,13 @@ enum AsadocCommand {
     },
     /// How Asadoc works: markers, their options, ignoring, checking
     Guide,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum CheckFormat {
+    Text,
+    Markdown,
+    Github,
 }
 
 fn main() -> ExitCode {
@@ -85,13 +98,21 @@ fn run() -> Result<bool> {
             print!("{}", include_str!("../GUIDE.md"));
             Ok(true)
         }
-        AsadocCommand::Check { refs, against } => {
+        AsadocCommand::Check { refs, against, format } => {
+            if !refs.is_empty() && *format != CheckFormat::Text {
+                bail!("--format markdown and --format github are for checking everything; give no blocks or code");
+            }
             let config = load_config()?;
             let evaluation = eval::evaluate(&config, true).context("evaluating the doc blocks")?;
-            if refs.is_empty() {
-                check::check_all(&config, &evaluation).context("checking every doc block")
-            } else {
-                check::check_refs(&evaluation, refs, against.as_deref()).context("checking what was given")
+            match format {
+                _ if !refs.is_empty() => {
+                    check::check_refs(&evaluation, refs, against.as_deref()).context("checking what was given")
+                }
+                CheckFormat::Text => check::check_all(&config, &evaluation).context("checking every doc block"),
+                CheckFormat::Markdown => {
+                    github::print_markdown(&config, &evaluation).context("checking every doc block")
+                }
+                CheckFormat::Github => github::report(&config, &evaluation).context("checking every doc block"),
             }
         }
         AsadocCommand::Todo => check::list_todos(&load_config()?).context("listing the TODOs"),

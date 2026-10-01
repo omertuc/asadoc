@@ -143,7 +143,7 @@ fn block_location(block_eval: &BlockEval) -> String {
     format!("modules/{}.adoc:{}", block_eval.block.module, block_eval.block.line)
 }
 
-fn closest_from_candidate(candidate: &CandidateInfo) -> Closest {
+pub(crate) fn closest_from_candidate(candidate: &CandidateInfo) -> Closest {
     match candidate.kind {
         "lines" => {
             let (first_line, last_line) = candidate.line_range.unwrap_or_default();

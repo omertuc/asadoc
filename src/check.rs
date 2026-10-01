@@ -14,12 +14,12 @@ use crate::report::{
 };
 use anyhow::{Context, Result};
 
-fn plural(count: usize, singular: &str, plural_form: &str) -> String {
+pub(crate) fn plural(count: usize, singular: &str, plural_form: &str) -> String {
     format!("{count} {}", if count == 1 { singular } else { plural_form })
 }
 
 /// A line difference, in words
-fn describe_line_diff(line_diff: LineDiff) -> String {
+pub(crate) fn describe_line_diff(line_diff: LineDiff) -> String {
     let doc_line_count_phrase = plural(line_diff.doc_line_count, "line", "lines");
     match (
         line_diff.differing_lines,
@@ -81,7 +81,7 @@ pub(crate) fn check_all(config: &AsadocConfig, evaluation: &Evaluation) -> Resul
     Ok(summary.ok())
 }
 
-fn print_summary(summary: &CheckSummary) {
+pub(crate) fn print_summary(summary: &CheckSummary) {
     let blocks_to_resolve = summary.blocks_to_resolve();
     match summary.docs_descriptions.as_slice() {
         [docs_description] => println!("Docs: {docs_description}"),
